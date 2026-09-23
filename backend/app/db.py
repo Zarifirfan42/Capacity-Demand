@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "cdi.db"
+# Vercel can write only under /tmp. Each new instance starts from an empty file and reseeds.
+if os.getenv("VERCEL"):
+    DB_PATH = Path("/tmp") / "cdi.db"
+else:
+    DB_PATH = Path(__file__).resolve().parent.parent / "data" / "cdi.db"
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;

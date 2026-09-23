@@ -37,9 +37,24 @@ app.add_middleware(
 )
 
 
+_ready = False
+
+
 @app.on_event("startup")
 def _startup() -> None:
+    global _ready
     seed()
+    _ready = True
+
+
+@app.middleware("http")
+async def _seed_once(request, call_next):
+    """Serverless instances may skip the startup hook. Seed before the first call."""
+    global _ready
+    if not _ready:
+        seed()
+        _ready = True
+    return await call_next(request)
 
 
 class InventoryAdjustment(BaseModel):
