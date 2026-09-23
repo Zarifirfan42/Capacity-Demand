@@ -1,0 +1,558 @@
+"""HTTP API for the Capacity & Demand Intelligence prototype."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from typing import Literal
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from app.db import connect, fetch_all, fetch_one
+from app.economics import ASSUMPTIONS, HORIZON_END, HORIZON_START
+from app.engine import (
+    allocate,
+    apply_scenario,
+    capacity_view,
+    control_tower,
+    feasibility,
+    load_world,
+    parse_user_date,
+    score_targets,
+    solve_bucket,
+)
+from app.extractor import SAMPLE_EMAIL, SAMPLE_OCR, extract_demand
+from app.impact import build_impact
+from app.seed import seed
+
+app = FastAPI(title="Capacity & Demand Intelligence", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    seed()
+
+
+class InventoryAdjustment(BaseModel):
+    plant_id: int
+    product_id: int
+    on_hand_delta_m3: float
+
+
+class DemandAdjustment(BaseModel):
+    demand_id: int
+    requested_quantity: float | None = None
+    required_date: str | None = None
+    contribution_margin: float | None = None
+    contractual_penalty: float | None = None
+    delay_days_if_unserved: float | None = None
+    delay_cost_per_day: float | None = None
+    project_criticality: str | None = None
+    confidence_level: Literal["Confirmed", "Probable", "Forecast"] | None = None
+
+
+class ScenarioIn(BaseModel):
+    name: str = "Scenario"
+    capacity_factor: float = Field(default=1.0, ge=0.5, le=1.5)
+    plant_id: int | None = None
+    product_id: int | None = None
+    inventory_adjustments: list[InventoryAdjustment] = []
+    demand_adjustments: list[DemandAdjustment] = []
+
+
+class CompareIn(BaseModel):
+    scenarios: list[ScenarioIn] = Field(min_length=1, max_length=3)
+
+
+class ExtractIn(BaseModel):
+    text: str
+    source: Literal["Email intake", "Simulated OCR"] = "Email intake"
+
+
+class DemandCreate(BaseModel):
+    demand_type: Literal["Internal", "External"]
+    customer_or_project: str = Field(min_length=2, max_length=80)
+    customer_type: str = Field(min_length=2, max_length=60)
+    plant_id: int
+    product_id: int
+    required_date: str
+    requested_quantity: float = Field(gt=0, le=10000)
+    confirmed_quantity: float = Field(ge=0, le=10000)
+    demand_status: str = Field(min_length=2, max_length=40)
+    confidence_level: Literal["Confirmed", "Probable", "Forecast"]
+    contribution_margin: float = Field(ge=0, le=100000000)
+    contractual_penalty: float = Field(ge=0, le=100000000)
+    project_criticality: str = "n/a"
+    delay_days_if_unserved: float = Field(ge=0, le=365)
+    delay_cost_per_day: float = Field(ge=0, le=100000000)
+    source: str = "Email intake"
+    notes: str = ""
+
+
+class AllocationLineIn(BaseModel):
+    demand_id: int
+    allocated_quantity: float = Field(ge=0)
+
+
+class OverrideIn(BaseModel):
+    plant_id: int
+    product_id: int
+    allocations: list[AllocationLineIn]
+    scenario: ScenarioIn | None = None
+
+
+class DecisionIn(OverrideIn):
+    username: str = Field(min_length=2, max_length=80)
+    override_reason: str = Field(min_length=3, max_length=1000)
+
+
+def _scenario_dict(scenario: ScenarioIn | None) -> dict | None:
+    if scenario is None:
+        return None
+    payload = scenario.model_dump()
+    for adj in payload["demand_adjustments"]:
+        if adj.get("required_date"):
+            adj["required_date"] = parse_user_date(adj["required_date"])
+        if adj.get("requested_quantity") is not None and adj["requested_quantity"] <= 0:
+            raise HTTPException(status_code=400, detail="Scenario quantity must be greater than zero.")
+    return payload
+
+
+def _targets(world: dict, plant_id: int, product_id: int, lines: list[AllocationLineIn]) -> dict[int, float]:
+    demands = [row for row in world["demands"] if row["plant_id"] == plant_id and row["product_id"] == product_id]
+    if not demands:
+        raise HTTPException(status_code=404, detail="No demand for that plant and product.")
+    incoming = {line.demand_id: line.allocated_quantity for line in lines}
+    missing = [row["demand_code"] for row in demands if row["id"] not in incoming]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Allocation is missing {', '.join(missing)}.")
+    extra = set(incoming) - {row["id"] for row in demands}
+    if extra:
+        raise HTTPException(status_code=400, detail="Allocation includes a demand line from another plant or product.")
+    return incoming
+
+
+@app.get("/api/health")
+def health() -> dict:
+    return {"status": "ok", "solver": "CBC linear programme"}
+
+
+@app.get("/api/meta")
+def meta() -> dict:
+    world = load_world()
+    return {
+        "horizon": {"start": HORIZON_START, "end": HORIZON_END},
+        "plants": world["plants"],
+        "products": world["products"],
+        "assumptions": ASSUMPTIONS,
+        "confidence_levels": ["Confirmed", "Probable", "Forecast"],
+        "demand_types": ["Internal", "External"],
+        "criticality_levels": ["Critical", "High", "Medium", "Low", "n/a"],
+        "samples": {"ocr": SAMPLE_OCR, "email": SAMPLE_EMAIL},
+        "demands": [
+            {
+                "id": row["id"],
+                "demand_code": row["demand_code"],
+                "customer_or_project": row["customer_or_project"],
+                "demand_type": row["demand_type"],
+                "plant_id": row["plant_id"],
+                "product_id": row["product_id"],
+                "required_date": row["required_date"],
+                "requested_quantity": row["requested_quantity"],
+                "contribution_margin": row["contribution_margin"],
+                "contractual_penalty": row["contractual_penalty"],
+                "delay_days_if_unserved": row["delay_days_if_unserved"],
+                "delay_cost_per_day": row["delay_cost_per_day"],
+                "project_criticality": row["project_criticality"],
+                "confidence_level": row["confidence_level"],
+            }
+            for row in world["demands"]
+        ],
+    }
+
+
+@app.get("/api/control-tower")
+def get_control_tower() -> dict:
+    payload = control_tower()
+    with connect() as conn:
+        payload["recent_decisions"] = fetch_all(
+            conn,
+            """
+            SELECT id, created_at, username, plant_name, product_name, status, override_reason,
+                   consequence_recommended, consequence_final, unserved_recommended, unserved_final
+            FROM decisions
+            ORDER BY id DESC
+            LIMIT 8
+            """,
+        )
+    return payload
+
+
+@app.get("/api/demands")
+def list_demands(
+    plant_id: int | None = None,
+    product_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    customer: str | None = None,
+    demand_status: str | None = None,
+    confidence_level: str | None = None,
+    demand_type: str | None = None,
+) -> dict:
+    clauses = ["1=1"]
+    params: list = []
+    if plant_id:
+        clauses.append("d.plant_id = ?")
+        params.append(plant_id)
+    if product_id:
+        clauses.append("d.product_id = ?")
+        params.append(product_id)
+    if date_from:
+        clauses.append("d.required_date >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("d.required_date <= ?")
+        params.append(date_to)
+    if customer:
+        clauses.append("d.customer_or_project LIKE ?")
+        params.append(f"%{customer.strip()}%")
+    if demand_status:
+        clauses.append("d.demand_status = ?")
+        params.append(demand_status)
+    if confidence_level:
+        clauses.append("d.confidence_level = ?")
+        params.append(confidence_level)
+    if demand_type:
+        clauses.append("d.demand_type = ?")
+        params.append(demand_type)
+    sql = f"""
+        SELECT d.*, p.name AS plant_name, p.code AS plant_code, r.name AS product_name, r.code AS product_code
+        FROM demands d
+        JOIN plants p ON p.id = d.plant_id
+        JOIN products r ON r.id = d.product_id
+        WHERE {' AND '.join(clauses)}
+        ORDER BY d.required_date, d.id
+    """
+    with connect() as conn:
+        rows = fetch_all(conn, sql, tuple(params))
+        statuses = [row["demand_status"] for row in fetch_all(conn, "SELECT DISTINCT demand_status FROM demands ORDER BY 1")]
+    internal = sum(row["requested_quantity"] for row in rows if row["demand_type"] == "Internal")
+    external = sum(row["requested_quantity"] for row in rows if row["demand_type"] == "External")
+    return {
+        "rows": rows,
+        "count": len(rows),
+        "totals": {
+            "requested_m3": round(internal + external, 2),
+            "internal_m3": round(internal, 2),
+            "external_m3": round(external, 2),
+            "contribution_margin_rm": round(sum(row["contribution_margin"] for row in rows), 2),
+            "contractual_penalty_rm": round(sum(row["contractual_penalty"] for row in rows), 2),
+        },
+        "statuses": statuses,
+    }
+
+
+@app.post("/api/demands/extract")
+def extract(body: ExtractIn) -> dict:
+    world = load_world()
+    return extract_demand(body.text, world["plants"], world["products"], body.source)
+
+
+@app.post("/api/demands")
+def create_demand(body: DemandCreate) -> dict:
+    try:
+        required = parse_user_date(body.required_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if body.confirmed_quantity - body.requested_quantity > 0.01:
+        raise HTTPException(status_code=400, detail="Confirmed quantity cannot exceed requested quantity.")
+    if body.source not in ("Email intake", "Simulated OCR", "Manual"):
+        raise HTTPException(status_code=400, detail="New lines must come from intake or a manual entry.")
+    prefix = "INT" if body.demand_type == "Internal" else "EXT"
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect() as conn:
+        plant = fetch_one(conn, "SELECT id FROM plants WHERE id = ?", (body.plant_id,))
+        product = fetch_one(conn, "SELECT id FROM products WHERE id = ?", (body.product_id,))
+        if plant is None or product is None:
+            raise HTTPException(status_code=400, detail="Plant or product was not recognised.")
+        seq = fetch_one(conn, "SELECT COUNT(*) AS n FROM demands WHERE demand_code LIKE ?", (f"{prefix}-IN-%",))
+        code = f"{prefix}-IN-{(seq['n'] if seq else 0) + 1:03d}"
+        conn.execute(
+            """
+            INSERT INTO demands(
+                demand_code, demand_type, customer_or_project, customer_type, plant_id, product_id,
+                required_date, requested_quantity, confirmed_quantity, demand_status, confidence_level,
+                contribution_margin, contractual_penalty, project_criticality, delay_days_if_unserved,
+                delay_cost_per_day, source, notes, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                code,
+                body.demand_type,
+                body.customer_or_project.strip(),
+                body.customer_type.strip(),
+                body.plant_id,
+                body.product_id,
+                required,
+                body.requested_quantity,
+                body.confirmed_quantity,
+                body.demand_status.strip(),
+                body.confidence_level,
+                body.contribution_margin,
+                body.contractual_penalty,
+                body.project_criticality,
+                body.delay_days_if_unserved,
+                body.delay_cost_per_day,
+                body.source,
+                body.notes.strip(),
+                now,
+            ),
+        )
+        row = fetch_one(conn, "SELECT * FROM demands WHERE demand_code = ?", (code,))
+    return {"demand": row}
+
+
+@app.delete("/api/demands/{demand_id}")
+def delete_demand(demand_id: int) -> dict:
+    with connect() as conn:
+        row = fetch_one(conn, "SELECT * FROM demands WHERE id = ?", (demand_id,))
+        if row is None:
+            raise HTTPException(status_code=404, detail="Demand line not found.")
+        if "-IN-" not in row["demand_code"]:
+            raise HTTPException(status_code=400, detail="Source-system demand stays in the book. Remove only lines added in this prototype.")
+        conn.execute("DELETE FROM demands WHERE id = ?", (demand_id,))
+    return {"deleted": demand_id}
+
+
+@app.get("/api/capacity")
+def get_capacity(plant_id: int = Query(...), product_id: int = Query(...)) -> dict:
+    world = load_world()
+    if not any(row["id"] == plant_id for row in world["plants"]):
+        raise HTTPException(status_code=404, detail="Plant not found.")
+    if not any(row["id"] == product_id for row in world["products"]):
+        raise HTTPException(status_code=404, detail="Product not found.")
+    return capacity_view(plant_id, product_id)
+
+
+@app.post("/api/allocate")
+def run_allocation(scenario: ScenarioIn | None = None) -> dict:
+    try:
+        return allocate(_scenario_dict(scenario))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/allocate/override")
+def preview_override(body: OverrideIn) -> dict:
+    try:
+        scenario = _scenario_dict(body.scenario)
+        world = apply_scenario(load_world(), scenario)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    targets = _targets(world, body.plant_id, body.product_id, body.allocations)
+    fit = feasibility(world, body.plant_id, body.product_id, targets)
+    scored = score_targets(world, body.plant_id, body.product_id, targets) if fit["feasible"] else None
+    bucket = solve_bucket(world, body.plant_id, body.product_id)
+    recommended = {
+        "expected_consequence_rm": bucket["expected_consequence_rm"],
+        "gross_consequence_rm": bucket["gross_consequence_rm"],
+        "unserved_m3": bucket["unserved_m3"],
+        "margin_at_risk_rm": bucket["margin_at_risk_rm"],
+        "programme_days": bucket["programme_days"],
+    }
+    delta = None
+    if scored is not None:
+        delta = {
+            "expected_consequence_rm": round(scored["expected_consequence_rm"] - recommended["expected_consequence_rm"], 2),
+            "gross_consequence_rm": round(scored["gross_consequence_rm"] - recommended["gross_consequence_rm"], 2),
+            "unserved_m3": round(scored["unserved_m3"] - recommended["unserved_m3"], 2),
+            "programme_days": round(scored["programme_days"] - recommended["programme_days"], 2),
+        }
+    changed = False
+    by_id = {line["demand_id"]: line for line in bucket["allocations"]}
+    for demand_id, allocated in targets.items():
+        if abs(allocated - by_id[demand_id]["allocated_quantity"]) > 0.1:
+            changed = True
+            break
+    return {
+        "feasible": fit["feasible"],
+        "message": fit["message"],
+        "changed_from_recommendation": changed,
+        "edited": None if scored is None else {"totals": {key: value for key, value in scored.items() if key != "allocations"}, "allocations": scored["allocations"]},
+        "recommended": recommended,
+        "delta_versus_recommendation": delta,
+    }
+
+
+@app.post("/api/decisions")
+def record_decision(body: DecisionIn) -> dict:
+    try:
+        scenario = _scenario_dict(body.scenario)
+        world = apply_scenario(load_world(), scenario)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    targets = _targets(world, body.plant_id, body.product_id, body.allocations)
+    fit = feasibility(world, body.plant_id, body.product_id, targets)
+    if not fit["feasible"]:
+        raise HTTPException(status_code=400, detail=fit["message"])
+    bucket = solve_bucket(world, body.plant_id, body.product_id)
+    scored = score_targets(world, body.plant_id, body.product_id, targets)
+    by_id = {line["demand_id"]: line for line in bucket["allocations"]}
+    changed = any(abs(allocated - by_id[demand_id]["allocated_quantity"]) > 0.1 for demand_id, allocated in targets.items())
+    reason = body.override_reason.strip()
+    if changed and len(reason) < 8:
+        raise HTTPException(status_code=400, detail="A modified allocation needs a reason of at least a short sentence.")
+    status = "modified" if changed else "approved"
+    recommended_payload = {
+        "scenario_name": world.get("scenario_name"),
+        "allocations": bucket["allocations"],
+        "totals": {
+            "unserved_m3": bucket["unserved_m3"],
+            "margin_at_risk_rm": bucket["margin_at_risk_rm"],
+            "penalty_at_risk_rm": bucket["penalty_at_risk_rm"],
+            "delay_cost_rm": bucket["delay_cost_rm"],
+            "gross_consequence_rm": bucket["gross_consequence_rm"],
+            "expected_consequence_rm": bucket["expected_consequence_rm"],
+            "programme_days": bucket["programme_days"],
+            "consequence_avoided_rm": bucket["consequence_avoided_rm"],
+        },
+    }
+    final_payload = {
+        "scenario_name": world.get("scenario_name"),
+        "allocations": scored["allocations"],
+        "totals": {key: value for key, value in scored.items() if key != "allocations"},
+        "reason": reason,
+    }
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect() as conn:
+        plant = fetch_one(conn, "SELECT name FROM plants WHERE id = ?", (body.plant_id,))
+        product = fetch_one(conn, "SELECT name FROM products WHERE id = ?", (body.product_id,))
+        cursor = conn.execute(
+            """
+            INSERT INTO decisions(
+                created_at, username, plant_id, product_id, plant_name, product_name,
+                recommended_json, final_json, override_reason, status,
+                consequence_recommended, consequence_final, unserved_recommended, unserved_final
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                body.username.strip(),
+                body.plant_id,
+                body.product_id,
+                plant["name"],
+                product["name"],
+                json.dumps(recommended_payload),
+                json.dumps(final_payload),
+                reason,
+                status,
+                bucket["expected_consequence_rm"],
+                scored["expected_consequence_rm"],
+                bucket["unserved_m3"],
+                scored["unserved_m3"],
+            ),
+        )
+        decision_id = cursor.lastrowid
+        saved = fetch_one(conn, "SELECT * FROM decisions WHERE id = ?", (decision_id,))
+    saved["recommended"] = json.loads(saved.pop("recommended_json"))
+    saved["final"] = json.loads(saved.pop("final_json"))
+    return {"decision": saved, "status": status}
+
+
+@app.get("/api/decisions")
+def list_decisions() -> dict:
+    with connect() as conn:
+        rows = fetch_all(conn, "SELECT * FROM decisions ORDER BY id DESC")
+    for row in rows:
+        row["recommended"] = json.loads(row.pop("recommended_json"))
+        row["final"] = json.loads(row.pop("final_json"))
+    return {"rows": rows}
+
+
+@app.post("/api/scenarios/compare")
+def compare_scenarios(body: CompareIn) -> dict:
+    try:
+        runs = [allocate(_scenario_dict(scenario)) for scenario in body.scenarios]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    comparison = []
+    for run in runs:
+        totals = run["totals"]
+        comparison.append(
+            {
+                "name": run["scenario_name"],
+                "notes": run["scenario_notes"],
+                "unserved_m3": totals["dated_shortfall_m3"],
+                "allocated_m3": totals["allocated_m3"],
+                "margin_at_risk_rm": totals["margin_at_risk_rm"],
+                "penalty_at_risk_rm": totals["penalty_at_risk_rm"],
+                "delay_cost_rm": totals["delay_cost_rm"],
+                "programme_days": totals["programme_days"],
+                "gross_consequence_rm": totals["gross_consequence_rm"],
+                "expected_consequence_rm": totals["expected_consequence_rm"],
+                "available_supply_m3": totals["available_supply_m3"],
+                "total_demand_m3": totals["total_demand_m3"],
+            }
+        )
+    baseline = comparison[0]["expected_consequence_rm"] if comparison else 0
+    for row in comparison:
+        row["delta_versus_first_rm"] = round(row["expected_consequence_rm"] - baseline, 2)
+    return {
+        "comparison": comparison,
+        "runs": [
+            {
+                "scenario_name": run["scenario_name"],
+                "scenario_notes": run["scenario_notes"],
+                "totals": run["totals"],
+                "buckets": [
+                    {
+                        "plant_id": bucket["plant_id"],
+                        "product_id": bucket["product_id"],
+                        "plant_name": bucket["plant_name"],
+                        "product_name": bucket["product_name"],
+                        "constrained": bucket["constrained"],
+                        "available_supply_m3": bucket["available_supply_m3"],
+                        "total_demand_m3": bucket["total_demand_m3"],
+                        "shortfall_m3": bucket["shortfall_m3"],
+                        "expected_consequence_rm": bucket["expected_consequence_rm"],
+                        "gross_consequence_rm": bucket["gross_consequence_rm"],
+                        "margin_at_risk_rm": bucket["margin_at_risk_rm"],
+                        "programme_days": bucket["programme_days"],
+                        "allocations": [
+                            {
+                                "demand_id": line["demand_id"],
+                                "demand_code": line["demand_code"],
+                                "customer_or_project": line["customer_or_project"],
+                                "demand_type": line["demand_type"],
+                                "requested_quantity": line["requested_quantity"],
+                                "allocated_quantity": line["allocated_quantity"],
+                                "unserved_quantity": line["unserved_quantity"],
+                                "expected_consequence_rm": line["expected_consequence_rm"],
+                                "gross_consequence_rm": line["gross_consequence_rm"],
+                                "reason": line["reason"],
+                            }
+                            for line in bucket["allocations"]
+                        ],
+                        "explanation": bucket["explanation"],
+                    }
+                    for bucket in run["buckets"]
+                    if bucket["constrained"] or bucket["total_demand_m3"] > 0
+                ],
+            }
+            for run in runs
+        ],
+    }
+
+
+@app.get("/api/impact")
+def impact() -> dict:
+    return build_impact()
