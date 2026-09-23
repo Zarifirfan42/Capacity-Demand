@@ -1,0 +1,16 @@
+[project]
+name = "capacity-demand-intelligence"
+version = "1.0.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.32",
+  "pulp>=2.8",
+  "pydantic>=2.6",
+]
+
+[tool.vercel]
+entrypoint = "api.index:app"
+
+[tool.vercel.fastapi.static]
+cdn = true

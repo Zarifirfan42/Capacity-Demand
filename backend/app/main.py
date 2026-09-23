@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
@@ -571,3 +572,9 @@ def compare_scenarios(body: CompareIn) -> dict:
 @app.get("/api/impact")
 def impact() -> dict:
     return build_impact()
+
+
+# The built UI is served by Vercel. API routes stay on this app and take priority.
+_frontend_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+if hasattr(app, "frontend"):
+    app.frontend("/", directory=str(_frontend_dist), fallback="index.html", check_dir=False)
