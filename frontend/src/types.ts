@@ -154,6 +154,7 @@ export type Bucket = {
     basis: string;
   };
   expedite_screen: {
+    demand_id?: number;
     customer_or_project: string;
     unserved_quantity: number;
     close_m3?: number;
@@ -196,6 +197,15 @@ export type Bucket = {
   stranded_note: string;
   objective: string;
   solver: string;
+  plant_mode?: "shadow" | "pilot";
+  open_decision?: {
+    id: number;
+    username: string;
+    created_at: string;
+    status: string;
+    locked: boolean;
+    lines: { demand_id: number; customer_or_project: string; committed_m3: number; recommended_m3: number }[];
+  } | null;
   objective_epsilon_rm?: number;
   recommendation_basis?: string;
   comparison?: {

@@ -24,7 +24,7 @@ type Fragility = {
 
 export function AllocationPage() {
   const { name } = usePlanner();
-  const [params] = useSearchParams();
+  const [params, setParams] = useSearchParams();
   const [result, setResult] = useState<AllocationResult | null>(null);
   const [decisions, setDecisions] = useState<DecisionRow[]>([]);
   const [key, setKey] = useState("");
@@ -38,29 +38,77 @@ export function AllocationPage() {
   const [chosenPlan, setChosenPlan] = useState("");
   const [termLines, setTermLines] = useState<{ statement: string }[]>([]);
   const [termsConfirmed, setTermsConfirmed] = useState(false);
+  const [shadowForm, setShadowForm] = useState<{ plantId: number; productId: number; rows: { id: number; customer_or_project: string; requested_quantity: number }[] } | null>(null);
+  const [shadowQty, setShadowQty] = useState<Record<number, number>>({});
+  const [reveal, setReveal] = useState(0);
+  const [bufferDays, setBufferDays] = useState(0);
+  const [catalog, setCatalog] = useState<{ plants: { id: number; name: string }[]; products: { id: number; code: string }[] }>({ plants: [], products: [] });
+  const [actualDraft, setActualDraft] = useState<Record<number, { delivered: number; date: string; days: number; penalty: number }>>({});
+  const [pairedNote, setPairedNote] = useState("");
+  const [expediteOrder, setExpediteOrder] = useState("");
+  const [expediteDraft, setExpediteDraft] = useState({ rate: 0, volume: 0, would: 0, paid: 0, full: false, onTime: false, decision: "approve" });
 
   function refreshDecisions() {
     api<{ rows: DecisionRow[] }>("/api/decisions").then((payload) => setDecisions(payload.rows)).catch(() => undefined);
   }
 
   useEffect(() => {
-    api<AllocationResult>("/api/allocate", { method: "POST", body: JSON.stringify(BASELINE) })
-      .then((payload) => {
+    let cancel = false;
+    const plant = Number(params.get("plant")) || 1;
+    const product = Number(params.get("product")) || 1;
+    api<{ plants: { id: number; mode: string }[]; buffer_days: number }>("/api/operations")
+      .then(async (ops) => {
+        if (!cancel) setBufferDays(ops.buffer_days);
+        const mode = ops.plants.find((item) => item.id === plant)?.mode ?? "shadow";
+        if (mode === "shadow") {
+          const plans = await api<{ rows: { id: number }[] }>(`/api/informal-plans?plant_id=${plant}&product_id=${product}`);
+          if (plans.rows.length === 0) {
+            const demands = await api<{ rows: { id: number; customer_or_project: string; requested_quantity: number }[] }>(`/api/demands?plant_id=${plant}&product_id=${product}`);
+            if (!cancel) {
+              setShadowForm({ plantId: plant, productId: product, rows: demands.rows });
+              const next: Record<number, number> = {};
+              demands.rows.forEach((row) => { next[row.id] = 0; });
+              setShadowQty(next);
+              setResult(null);
+            }
+            return;
+          }
+        }
+        const payload = await api<AllocationResult>("/api/allocate", { method: "POST", body: JSON.stringify(BASELINE) });
+        if (cancel) return;
+        setShadowForm(null);
         setResult(payload);
-        const plant = Number(params.get("plant"));
-        const product = Number(params.get("product"));
         const match = payload.buckets.find((bucket) => bucket.plant_id === plant && bucket.product_id === product);
         const first = match ?? payload.buckets.find((bucket) => bucket.constrained) ?? payload.buckets[0];
         if (first) setKey(`${first.plant_id}-${first.product_id}`);
       })
-      .catch((err: Error) => setError(err.message));
+      .catch((err: Error) => { if (!cancel) setError(err.message); });
     refreshDecisions();
-  }, [params]);
+    return () => { cancel = true; };
+  }, [params, reveal]);
+
+  useEffect(() => {
+    api<{ plants: { id: number; name: string }[]; products: { id: number; code: string }[] }>("/api/meta")
+      .then((meta) => setCatalog({ plants: meta.plants, products: meta.products }))
+      .catch(() => undefined);
+  }, []);
 
   const bucket: Bucket | undefined = useMemo(
     () => result?.buckets.find((item) => `${item.plant_id}-${item.product_id}` === key),
     [result, key],
   );
+
+  useEffect(() => {
+    if (!bucket) return;
+    api<{ rows: { paired_gap_rm: number; informal_expected_rm: number; recommendation_expected_rm: number }[] }>(
+      `/api/informal-plans?plant_id=${bucket.plant_id}&product_id=${bucket.product_id}`,
+    )
+      .then((payload) => {
+        const row = payload.rows[0];
+        setPairedNote(row ? `Paired gap ${rm(row.paired_gap_rm)}: informal ${rm(row.informal_expected_rm)} minus recommendation ${rm(row.recommendation_expected_rm)} on this same book.` : "");
+      })
+      .catch(() => setPairedNote(""));
+  }, [bucket]);
 
   useEffect(() => {
     if (!bucket) return;
@@ -83,6 +131,11 @@ export function AllocationPage() {
       next[line.demand_id] = line.allocated_quantity;
     });
     setEdits(next);
+    const draft: Record<number, { delivered: number; date: string; days: number; penalty: number }> = {};
+    bucket.allocations.forEach((line) => {
+      draft[line.demand_id] = { delivered: line.allocated_quantity, date: String(line.required_date).slice(0, 10), days: 0, penalty: 0 };
+    });
+    setActualDraft(draft);
     setReason("Accepted the recommendation.");
     setSaved("");
   }, [bucket]);
@@ -132,6 +185,7 @@ export function AllocationPage() {
           reason_category: category,
           chosen_plan: chosenPlan,
           terms_confirmed: termsConfirmed,
+          replace: Boolean(bucket.open_decision && !bucket.open_decision.locked),
           allocations: bucket.allocations.map((line) => ({
             demand_id: line.demand_id,
             allocated_quantity: Number(edits[line.demand_id] ?? 0),
@@ -143,6 +197,133 @@ export function AllocationPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not record the decision.");
     }
+  }
+
+  async function saveBuffer(days: number) {
+    setBufferDays(days);
+    try {
+      await api("/api/buffer-days", { method: "POST", body: JSON.stringify({ buffer_days: days }) });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not store the buffer.");
+    }
+  }
+
+  async function switchMode(plantId: number, mode: "shadow" | "pilot") {
+    setError("");
+    try {
+      await api(`/api/plants/${plantId}/mode`, { method: "POST", body: JSON.stringify({ mode }) });
+      setReveal((value) => value + 1);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not change the plant mode.");
+    }
+  }
+
+  async function saveActuals() {
+    if (!bucket?.open_decision) return;
+    setError("");
+    try {
+      await api(`/api/decisions/${bucket.open_decision.id}/actual`, {
+        method: "POST",
+        body: JSON.stringify({
+          username: name || "Planner",
+          lines: bucket.allocations.map((line) => ({
+            demand_id: line.demand_id,
+            delivered_m3: Number(actualDraft[line.demand_id]?.delivered ?? 0),
+            actual_delivery_date: actualDraft[line.demand_id]?.date || line.required_date,
+            programme_days_lost: line.demand_type === "Internal" ? Number(actualDraft[line.demand_id]?.days ?? 0) : 0,
+            penalty_paid_rm: line.demand_type === "External" ? Number(actualDraft[line.demand_id]?.penalty ?? 0) : 0,
+          })),
+        }),
+      });
+      setSaved("Actuals stored. This decision is locked.");
+      setReveal((value) => value + 1);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not store actuals.");
+    }
+  }
+
+  async function saveExpedite() {
+    if (!bucket) return;
+    const screen = bucket.expedite_screen.find((row) => row.customer_or_project === expediteOrder) ?? bucket.expedite_screen[0];
+    const line = bucket.allocations.find((row) => row.customer_or_project === screen?.customer_or_project);
+    if (!screen || !line) return;
+    setError("");
+    try {
+      const response = await api<{ estimated_avoided_rm: number | null; label: string }>("/api/expedite-decisions", {
+        method: "POST",
+        body: JSON.stringify({
+          username: name || "Planner",
+          plant_id: bucket.plant_id,
+          product_id: bucket.product_id,
+          demand_id: line.demand_id,
+          customer_or_project: screen.customer_or_project,
+          decision: expediteDraft.decision,
+          emergency_rm_per_m3: expediteDraft.rate,
+          available_volume_m3: expediteDraft.volume,
+          cost_rm: expediteDraft.rate * expediteDraft.volume,
+          penalty_would_apply_rm: expediteDraft.would,
+          delivered_in_full: expediteDraft.full,
+          on_time: expediteDraft.onTime,
+          penalty_paid_rm: expediteDraft.paid,
+        }),
+      });
+      const avoided = response.estimated_avoided_rm == null ? "not estimated" : rm(response.estimated_avoided_rm);
+      setSaved(`Expedite recorded. ${response.label}: ${avoided}.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not record the expedite.");
+    }
+  }
+
+  async function saveInformal() {
+    if (!shadowForm) return;
+    setError("");
+    try {
+      const response = await api<{ paired_gap_rm: number; informal_expected_rm: number; recommendation_expected_rm: number }>("/api/informal-plans", {
+        method: "POST",
+        body: JSON.stringify({
+          username: name || "Planner",
+          plant_id: shadowForm.plantId,
+          product_id: shadowForm.productId,
+          allocations: shadowForm.rows.map((row) => ({ demand_id: row.id, allocated_quantity: Number(shadowQty[row.id] ?? 0) })),
+        }),
+      });
+      setSaved(`Informal plan stored. Paired gap ${rm(response.paired_gap_rm)}: informal ${rm(response.informal_expected_rm)} minus recommendation ${rm(response.recommendation_expected_rm)} on this same book.`);
+      setReveal((value) => value + 1);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not store the informal plan.");
+    }
+  }
+
+  if (shadowForm) {
+    return (
+      <div className="page">
+        <PageHeader kicker="Shadow" title="Informal plan" lede="Record what you would actually run before the recommendation is shown. Both plans are then scored on this same book." />
+        {error ? <ErrorNote message={error} /> : null}
+        <Panel title="Quantities you would run" sub="This plant is in shadow. The recommendation stays hidden until this plan is stored.">
+          <div className="field"><label>Plant</label>
+            <select value={shadowForm.plantId} onChange={(event) => setParams({ plant: event.target.value, product: String(shadowForm.productId) })}>
+              {catalog.plants.map((plant) => <option key={plant.id} value={plant.id}>{plant.name}</option>)}
+            </select>
+          </div>
+          <div className="field"><label>Product</label>
+            <select value={shadowForm.productId} onChange={(event) => setParams({ plant: String(shadowForm.plantId), product: event.target.value })}>
+              {catalog.products.map((product) => <option key={product.id} value={product.id}>{product.code}</option>)}
+            </select>
+          </div>
+          <div className="field"><label>Buffer days for lump-sum orders</label>
+            <input type="number" min={0} max={14} value={bufferDays} onChange={(event) => void saveBuffer(Number(event.target.value))} />
+          </div>
+          {shadowForm.rows.map((row) => (
+            <div className="field" key={row.id}>
+              <label>{row.customer_or_project} · requested {m3(row.requested_quantity)}</label>
+              <input type="number" min={0} value={shadowQty[row.id] ?? 0} onChange={(event) => setShadowQty({ ...shadowQty, [row.id]: Number(event.target.value) })} />
+            </div>
+          ))}
+          <button className="btn primary" onClick={() => void saveInformal()}>Store informal plan as {name || "planner"}</button>
+          <button className="btn" onClick={() => void switchMode(shadowForm.plantId, "pilot")}>Switch this plant to pilot</button>
+        </Panel>
+      </div>
+    );
   }
 
   if (error && !result) return <ErrorNote message={error} />;
@@ -167,7 +348,14 @@ export function AllocationPage() {
         {result.buckets.filter((item) => item.total_demand_m3 > 0).map((item) => {
           const id = `${item.plant_id}-${item.product_id}`;
           return (
-            <button key={id} className={`btn ${id === key ? "on" : ""}`} onClick={() => setKey(id)}>
+            <button key={id} className={`btn ${id === key ? "on" : ""}`} onClick={() => {
+              const mode = item.plant_mode ?? "shadow";
+              if (mode === "shadow") {
+                setParams({ plant: String(item.plant_id), product: String(item.product_id) });
+                return;
+              }
+              setKey(id);
+            }}>
               {item.plant_name.split(" ")[0]} {item.product_code}{item.constrained ? ` · short ${m3(item.shortfall_m3)}` : " · covered"}
             </button>
           );
@@ -175,6 +363,26 @@ export function AllocationPage() {
       </div>
       {error ? <ErrorNote message={error} /> : null}
       {saved ? <div className="banner good">{saved}</div> : null}
+      {bucket.open_decision ? (
+        <div className="banner warn">
+          <strong>Open decision: you are replacing {bucket.open_decision.username} at {bucket.open_decision.created_at}.</strong>
+          {bucket.open_decision.locked ? <p>Actuals are recorded. This decision is locked.</p> : (
+            <ul>
+              {bucket.open_decision.lines.map((line) => (
+                <li key={line.demand_id}>{line.customer_or_project}: committed {m3(line.committed_m3)}, recommendation was {m3(line.recommended_m3)}, screen shows {m3(edits[line.demand_id] ?? 0)}.</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : null}
+      {bucket.plant_mode === "shadow" ? <p className="note">This plant is in shadow. The informal plan is the executed plan. The paired gap is informal expected consequence minus the recommendation on this same book.</p> : <p className="note">This plant is in pilot. An approval writes committed production onto the calendar.</p>}
+      {pairedNote ? <div className="banner good">{pairedNote}</div> : null}
+      <div className="field"><label>Buffer days for lump-sum orders</label>
+        <input type="number" min={0} max={14} value={bufferDays} onChange={(event) => void saveBuffer(Number(event.target.value))} />
+      </div>
+      <button className="btn" onClick={() => void switchMode(bucket.plant_id, bucket.plant_mode === "pilot" ? "shadow" : "pilot")}>
+        {bucket.plant_mode === "pilot" ? "Return this plant to shadow" : "Switch this plant to pilot"}
+      </button>
 
       <div className="kpi-grid">
         <Kpi label="Available supply" value={m3(bucket.available_supply_m3)} hint={bucket.stockable === false ? "Ready-mix cannot be stocked. Supply is dated capacity only." : `${m3(bucket.available_capacity_m3)} capacity + ${m3(bucket.usable_inventory_m3)} usable inventory`} />
@@ -375,10 +583,25 @@ export function AllocationPage() {
             Commercial owner confirms the unverified contract term before sign-off.
           </label>
         ) : null}
-        <button className="btn primary" disabled={preview?.feasible === false || !name.trim() || (mustChoose && !chosenPlan) || (termLines.length > 0 && !termsConfirmed)} onClick={() => void record()}>
+        <button className="btn primary" disabled={preview?.feasible === false || !name.trim() || (mustChoose && !chosenPlan) || (termLines.length > 0 && !termsConfirmed) || Boolean(bucket.open_decision?.locked)} onClick={() => void record()}>
           Record decision as {name || "planner"}
         </button>
       </Panel>
+
+      {bucket.open_decision && !bucket.open_decision.locked ? (
+        <Panel title="Record actuals" sub="Delivered quantity may sit up to 5% above requested. Saving actuals locks this decision.">
+          {bucket.allocations.map((line) => (
+            <div className="field" key={line.demand_id}>
+              <label>{line.customer_or_project} · requested {m3(line.requested_quantity)}</label>
+              <input type="number" min={0} value={actualDraft[line.demand_id]?.delivered ?? 0} onChange={(event) => setActualDraft({ ...actualDraft, [line.demand_id]: { ...actualDraft[line.demand_id], delivered: Number(event.target.value), date: actualDraft[line.demand_id]?.date || String(line.required_date).slice(0, 10), days: actualDraft[line.demand_id]?.days ?? 0, penalty: actualDraft[line.demand_id]?.penalty ?? 0 } })} />
+              <input type="date" value={actualDraft[line.demand_id]?.date || String(line.required_date).slice(0, 10)} onChange={(event) => setActualDraft({ ...actualDraft, [line.demand_id]: { delivered: actualDraft[line.demand_id]?.delivered ?? 0, date: event.target.value, days: actualDraft[line.demand_id]?.days ?? 0, penalty: actualDraft[line.demand_id]?.penalty ?? 0 } })} />
+              {line.demand_type === "Internal" ? <input type="number" min={0} max={365} value={actualDraft[line.demand_id]?.days ?? 0} onChange={(event) => setActualDraft({ ...actualDraft, [line.demand_id]: { delivered: actualDraft[line.demand_id]?.delivered ?? 0, date: actualDraft[line.demand_id]?.date || String(line.required_date).slice(0, 10), days: Number(event.target.value), penalty: 0 } })} /> : null}
+              {line.demand_type === "External" ? <input type="number" min={0} value={actualDraft[line.demand_id]?.penalty ?? 0} onChange={(event) => setActualDraft({ ...actualDraft, [line.demand_id]: { delivered: actualDraft[line.demand_id]?.delivered ?? 0, date: actualDraft[line.demand_id]?.date || String(line.required_date).slice(0, 10), days: 0, penalty: Number(event.target.value) } })} /> : null}
+            </div>
+          ))}
+          <button className="btn" onClick={() => void saveActuals()}>Save actuals and lock</button>
+        </Panel>
+      ) : null}
 
       {bucket.expedite_screen.length > 0 ? (
         <Panel title="Expedite screen" sub="Cost to close a firing lump. Emergency supply is a proposal, not base capacity.">
@@ -415,6 +638,26 @@ export function AllocationPage() {
               </tbody>
             </table>
           </div>
+          <div className="field"><label>Order</label>
+            <select value={expediteOrder} onChange={(event) => setExpediteOrder(event.target.value)}>
+              <option value="">Select an order</option>
+              {bucket.expedite_screen.map((row) => <option key={row.customer_or_project}>{row.customer_or_project}</option>)}
+            </select>
+          </div>
+          <div className="field"><label>Decision</label>
+            <select value={expediteDraft.decision} onChange={(event) => setExpediteDraft({ ...expediteDraft, decision: event.target.value })}>
+              <option value="approve">Approve</option>
+              <option value="decline">Decline</option>
+            </select>
+          </div>
+          <div className="field"><label>Emergency RM per m³</label><input type="number" min={0} value={expediteDraft.rate} onChange={(event) => setExpediteDraft({ ...expediteDraft, rate: Number(event.target.value) })} /></div>
+          <div className="field"><label>Available volume m³</label><input type="number" min={0} value={expediteDraft.volume} onChange={(event) => setExpediteDraft({ ...expediteDraft, volume: Number(event.target.value) })} /></div>
+          <div className="field"><label>Penalty that would have applied</label><input type="number" min={0} value={expediteDraft.would} onChange={(event) => setExpediteDraft({ ...expediteDraft, would: Number(event.target.value) })} /></div>
+          <div className="field"><label>Penalty actually paid</label><input type="number" min={0} value={expediteDraft.paid} onChange={(event) => setExpediteDraft({ ...expediteDraft, paid: Number(event.target.value) })} /></div>
+          <label className="check"><input type="checkbox" checked={expediteDraft.full} onChange={(event) => setExpediteDraft({ ...expediteDraft, full: event.target.checked })} /> Delivered in full</label>
+          <label className="check"><input type="checkbox" checked={expediteDraft.onTime} onChange={(event) => setExpediteDraft({ ...expediteDraft, onTime: event.target.checked })} /> On time</label>
+          <p className="note">Estimated avoided is penalty that would have applied minus penalty paid, and only when the order was approved, delivered in full, and on time.</p>
+          <button className="btn" onClick={() => void saveExpedite()}>Record expedite</button>
         </Panel>
       ) : null}
 

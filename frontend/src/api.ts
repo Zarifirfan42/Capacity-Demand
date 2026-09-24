@@ -15,6 +15,8 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      "X-Demo-Role": sessionStorage.getItem("cdi-role") || "viewer",
+      "X-Demo-Passcode": sessionStorage.getItem("cdi-passcode") || "",
       ...(init?.headers ?? {}),
     },
   });

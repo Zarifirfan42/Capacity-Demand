@@ -5,6 +5,7 @@ import { CapacityPage } from "./pages/Capacity";
 import { ControlTowerPage } from "./pages/ControlTower";
 import { DemandPage } from "./pages/Demand";
 import { ImpactPage } from "./pages/Impact";
+import { MeasurementPage } from "./pages/Measurement";
 import { ScenarioPage } from "./pages/Scenarios";
 
 export function App() {
@@ -17,6 +18,7 @@ export function App() {
         <Route path="/allocation" element={<AllocationPage />} />
         <Route path="/scenarios" element={<ScenarioPage />} />
         <Route path="/impact" element={<ImpactPage />} />
+        <Route path="/measurement" element={<MeasurementPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

@@ -4,6 +4,7 @@ import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxi
 import { api } from "../api";
 import { Assumptions, ErrorNote, Kpi, PageHeader, Panel } from "../components";
 import { longDate, m3, num, rm, when } from "../format";
+import { usePlanner } from "../planner";
 import type { DecisionRow } from "../types";
 
 type Tower = {
@@ -71,14 +72,25 @@ type Tower = {
 };
 
 export function ControlTowerPage() {
+  const { role } = usePlanner();
   const [data, setData] = useState<Tower | null>(null);
   const [error, setError] = useState("");
+  const [tick, setTick] = useState(0);
 
   useEffect(() => {
     api<Tower>("/api/control-tower")
       .then(setData)
       .catch((err: Error) => setError(err.message));
-  }, []);
+  }, [tick]);
+
+  async function resetDemo() {
+    try {
+      await api("/api/admin/reset", { method: "POST", body: "{}" });
+      setTick((value) => value + 1);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Reset failed.");
+    }
+  }
 
   if (error) return <ErrorNote message={error} />;
   if (!data) return <p>Loading the planning position…</p>;
@@ -200,6 +212,7 @@ export function ControlTowerPage() {
       </div>
 
       <Panel title="Recorded decisions" sub="The system recommends. A named planner approves or changes the result.">
+        {role === "admin" ? <button className="btn" onClick={() => void resetDemo()}>Reset demo data</button> : null}
         {data.recent_decisions.length === 0 ? (
           <p className="note">No decision has been recorded yet. Open an allocation, review the reason, and record it.</p>
         ) : (
