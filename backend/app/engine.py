@@ -15,17 +15,35 @@ import pulp
 from app.db import connect, fetch_all
 from app.economics import (
     ASSUMPTIONS,
+    CONFIDENCE_FACTOR,
     CRITICALITY_MULT,
+    EMERGENCY_CAPACITY_SHARE,
+    FRAGILITY_REGRET_RM,
+    FRAGILITY_REGRET_SHARE,
     HORIZON_END,
     HORIZON_START,
+    OBJECTIVE_EPSILON_RM,
     READY_MIX_CODES,
+    SENSITIVITY_FACTORS,
     SHARED_READY_MIX_BATCHING,
+    SIMPLE_RULES,
+    SOLVER_TIME_LIMIT_SECONDS,
     consequence_for_unserved,
+    confidence_factor,
+    delay_type_of,
+    exposure_per_m3,
+    full_miss_delay_weight,
+    linear_unserved_rate,
+    parent_score,
+    penalty_type_of,
+    penalty_unverified,
     expedite_advice,
     line_economics,
+    remainder_confidence,
     review_case,
     round_m3,
     round_rm,
+    score_parent_unserved,
 )
 
 TOL = 0.05
@@ -180,6 +198,15 @@ def apply_scenario(world: dict, scenario: dict | None) -> dict:
         if adj.get("confidence_level"):
             demand["confidence_level"] = adj["confidence_level"]
             notes.append(f"{name}: {label} confidence set to {demand['confidence_level']}.")
+        if adj.get("unit_expected_factor") is not None:
+            factor = float(adj["unit_expected_factor"])
+            demand["contribution_margin"] = float(demand["contribution_margin"]) * factor
+            demand["contractual_penalty"] = float(demand["contractual_penalty"]) * factor
+            demand["delay_cost_per_day"] = float(demand["delay_cost_per_day"]) * factor
+            notes.append(
+                f"{name}: {label} unit expected consequence set to {factor:.0%} "
+                "by scaling margin, contractual penalty, and delay cost together."
+            )
     world["scenario_name"] = name
     world["scenario_notes"] = notes
     if "shared_ready_mix_batching" in scenario:
@@ -235,17 +262,26 @@ def expand_tranches(demand: dict) -> list[dict]:
         row["id"] = tranche_id
         row["parent_id"] = parent_id
         row["tranche"] = kind
+        row["score_parent"] = dict(demand)
         row["requested_quantity"] = qty
         row["confirmed_quantity"] = qty if kind == "confirmed" else 0.0
         row["confidence_level"] = level
         row["contribution_margin"] = float(demand["contribution_margin"]) * fraction
-        row["contractual_penalty"] = float(demand["contractual_penalty"]) * fraction
+        # The contractual penalty is an obligation on the confirmed cubic metres only.
+        row["contractual_penalty"] = float(demand["contractual_penalty"]) if kind == "confirmed" else 0.0
         row["delay_days_if_unserved"] = float(demand["delay_days_if_unserved"]) * fraction
         rows.append(row)
     return rows
 
 
-def _collapse_plan(parents: list[dict], tranches: list[dict], tranche_plan: dict[int, dict]) -> dict[int, dict]:
+def _collapse_plan(
+    parents: list[dict],
+    tranches: list[dict],
+    tranche_plan: dict[int, dict],
+    *,
+    penalty_as: str | dict[int, str] | None = None,
+    delay_as: str | None = None,
+) -> dict[int, dict]:
     by_parent: dict[int, list[dict]] = {}
     for tranche in tranches:
         by_parent.setdefault(int(tranche["parent_id"]), []).append(tranche)
@@ -266,6 +302,7 @@ def _collapse_plan(parents: list[dict], tranches: list[dict], tranche_plan: dict
             "programme_days": 0.0,
             "consequence_avoided_gross_rm": 0.0,
         }
+        scored_parts: list[tuple[str, float, float]] = []
         notes = []
         for part in parts:
             slot = tranche_plan.get(int(part["id"]), {"allocated": 0.0, "unserved": part["quantity"], "from_inventory": 0.0, "from_production": 0.0, "by_day": []})
@@ -273,13 +310,14 @@ def _collapse_plan(parents: list[dict], tranches: list[dict], tranche_plan: dict
             from_inv += float(slot["from_inventory"])
             from_prod += float(slot["from_production"])
             by_day.extend(slot.get("by_day") or [])
-            impact = consequence_for_unserved(part, float(slot["unserved"]))
-            for key in money:
-                money[key] += float(impact[key])
+            scored_parts.append((str(part.get("tranche") or "confirmed"), float(part["quantity"]), float(slot["unserved"])))
             weight = int(round(float(part["confidence_factor"]) * 100))
             notes.append(
                 f"{_m3(part['quantity'])} {part['tranche']} at {weight}% ({part['confidence_level']})"
             )
+        source = parts[0].get("score_parent") or parent
+        penalty_mode = penalty_as.get(parent_id) if isinstance(penalty_as, dict) else penalty_as
+        money = parent_score(source, scored_parts, penalty_as=penalty_mode, delay_as=delay_as)
         qty = float(parent["quantity"])
         allocated = _snap(allocated, qty)
         plan[parent_id] = {
@@ -298,13 +336,35 @@ def _collapse_plan(parents: list[dict], tranches: list[dict], tranche_plan: dict
     return plan
 
 
-def _plans_for(raw_demands: list[dict], days: list[str], cap: dict[str, float], usable: float) -> dict[str, dict[int, dict]]:
+def _expanded(raw_demands: list[dict]) -> tuple[list[dict], list[dict]]:
     parents = _prepare_demands(raw_demands)
     tranches = _prepare_demands([row for demand in raw_demands for row in expand_tranches(demand)])
-    optimised = _collapse_plan(parents, tranches, _solve_lp(tranches, days, cap, usable))
+    return parents, tranches
+
+
+def _plans_for(
+    raw_demands: list[dict],
+    days: list[str],
+    cap: dict[str, float],
+    usable: float,
+    *,
+    force_penalty: str | None = None,
+    force_delay: str | None = None,
+    lex: bool = True,
+) -> dict[str, dict[int, dict]]:
+    parents, tranches = _expanded(raw_demands)
+    optimised = _collapse_plan(
+        parents,
+        tranches,
+        _solve_lp(tranches, days, cap, usable, force_penalty=force_penalty, force_delay=force_delay, lex=lex),
+    )
+    if force_penalty is None and force_delay is None:
+        _plans_for.base_meta = dict(getattr(_solve_lp, "last_meta", {}))  # type: ignore[attr-defined]
     policies = {"optimised": optimised}
     for name in ("internal", "external", "earliest", "practice"):
         policies[name] = _collapse_plan(parents, tranches, _greedy(tranches, days, cap, usable, name))
+    for name in ("penalty_delay", "complete_or_skip", "unit_expected"):
+        policies[name] = _score_parent_plan(parents, _parent_greedy(parents, days, cap, usable, name))
     return policies
 
 
@@ -319,7 +379,36 @@ def _prepare_demands(demands: list[dict]) -> list[dict]:
     return prepared
 
 
-def _solve_lp(demands: list[dict], days: list[str], cap: dict[str, float], usable: float) -> dict[int, dict]:
+def _parent_of(demand: dict) -> dict:
+    return demand.get("score_parent") or demand
+
+
+def _applied_type(demand: dict, kind: str, force: str | None, overrides: dict[int, str] | None = None) -> str:
+    parent = _parent_of(demand)
+    parent_id = int(demand.get("parent_id") or parent.get("id") or demand["id"])
+    if overrides and parent_id in overrides:
+        return overrides[parent_id]
+    if force:
+        return force
+    return penalty_type_of(parent) if kind == "penalty" else delay_type_of(parent)
+
+
+def _solve_lp(
+    demands: list[dict],
+    days: list[str],
+    cap: dict[str, float],
+    usable: float,
+    unit_bonus: dict[int, float] | None = None,
+    lump_groups: list[dict] | None = None,
+    *,
+    force_penalty: str | None = None,
+    force_delay: str | None = None,
+    penalty_overrides: dict[int, str] | None = None,
+    lex: bool = True,
+    epsilon: float = OBJECTIVE_EPSILON_RM,
+    emergency_cost: float | None = None,
+    emergency_share: float = 0.0,
+) -> dict[int, dict]:
     if not demands:
         return {}
     problem = pulp.LpProblem("capacity_allocation", pulp.LpMinimize)
@@ -334,11 +423,74 @@ def _solve_lp(demands: list[dict], days: list[str], cap: dict[str, float], usabl
             if day <= demand["required_date"]:
                 production[demand_id, day] = pulp.LpVariable(f"p_{demand_id}_{day.replace('-', '')}", lowBound=0)
 
+    bonus = unit_bonus or {}
+    rates = {}
+    for demand in demands:
+        parent = _parent_of(demand)
+        rates[int(demand["id"])] = linear_unserved_rate(
+            parent,
+            str(demand.get("tranche") or "confirmed"),
+            float(demand["quantity"]),
+            penalty_as=_applied_type(demand, "penalty", force_penalty, penalty_overrides),
+            delay_as=_applied_type(demand, "delay", force_delay),
+        ) + float(bonus.get(int(demand["id"]), 0.0))
+
+    by_parent: dict[int, list[dict]] = {}
+    for demand in demands:
+        by_parent.setdefault(int(demand.get("parent_id") or demand["id"]), []).append(demand)
+
+    lump_terms = []
+    partials = []
+    date_weight = []
+    horizon = datetime.strptime(HORIZON_START, "%Y-%m-%d")
+    for parent_id, pieces in by_parent.items():
+        parent = _parent_of(pieces[0])
+        requested = float(parent["requested_quantity"])
+        confirmed = min(max(float(parent.get("confirmed_quantity") or 0.0), 0.0), requested)
+        penalty_type = _applied_type(pieces[0], "penalty", force_penalty, penalty_overrides)
+        delay_type = _applied_type(pieces[0], "delay", force_delay)
+        parent_unserved = pulp.lpSum(unserved[int(piece["id"])] for piece in pieces)
+        if penalty_type == "lump_sum" and confirmed > 0 and float(parent.get("contractual_penalty") or 0) > 0:
+            binary = pulp.LpVariable(f"pen_{parent_id}", cat="Binary")
+            confirmed_unserved = pulp.lpSum(
+                unserved[int(piece["id"])] for piece in pieces if piece.get("tranche") == "confirmed"
+            )
+            threshold = 0.0 if str(parent.get("lump_sum_trigger") or "any").strip().lower() in {"", "any", "any shortfall"} else confirmed * float(str(parent.get("lump_sum_trigger")).replace("%", "")) / 100.0
+            span = max(confirmed - threshold, 0.0)
+            problem += confirmed_unserved <= threshold + span * binary, f"pen_trigger_{parent_id}"
+            lump_terms.append(float(parent["contractual_penalty"]) * binary)
+        delay_total = float(parent.get("delay_days_if_unserved") or 0) * float(parent.get("delay_cost_per_day") or 0)
+        if delay_type == "lump_days" and delay_total > 0 and requested > 0:
+            binary = pulp.LpVariable(f"day_{parent_id}", cat="Binary")
+            raw_trigger = str(parent.get("lump_sum_trigger") or "any").strip().lower().replace("%", "")
+            threshold = 0.0 if raw_trigger in {"", "any", "any shortfall"} else requested * float(raw_trigger) / 100.0
+            span = max(requested - threshold, 0.0)
+            problem += parent_unserved <= threshold + span * binary, f"day_trigger_{parent_id}"
+            lump_terms.append(delay_total * full_miss_delay_weight(parent) * binary)
+        minimum = float(parent.get("minimum_useful_delivery_m3") or 0.0)
+        if minimum > TOL and minimum < requested - TOL:
+            useful = pulp.LpVariable(f"useful_{parent_id}", cat="Binary")
+            problem += parent_unserved <= (requested - minimum) + requested * (1 - useful), f"useful_hi_{parent_id}"
+            problem += parent_unserved >= requested * (1 - useful), f"useful_lo_{parent_id}"
+        miss = pulp.LpVariable(f"miss_{parent_id}", cat="Binary")
+        hit = pulp.LpVariable(f"hit_{parent_id}", cat="Binary")
+        partial = pulp.LpVariable(f"part_{parent_id}", cat="Binary")
+        problem += parent_unserved <= requested * miss + 1e-4, f"miss_{parent_id}"
+        problem += requested - parent_unserved <= requested * hit + 1e-4, f"hit_{parent_id}"
+        problem += partial >= miss + hit - 1, f"partial_{parent_id}"
+        partials.append(partial)
+        due = datetime.strptime(str(parent["required_date"]), "%Y-%m-%d")
+        date_weight.append((due - horizon).days * parent_unserved)
+
+    business = pulp.lpSum(rates[int(demand["id"])] * unserved[int(demand["id"])] for demand in demands) + pulp.lpSum(lump_terms)
+    extra: dict[str, pulp.LpVariable] = {}
+    if emergency_cost is not None and emergency_share > 0:
+        for day in days:
+            extra[day] = pulp.LpVariable(f"em_{day.replace('-', '')}", lowBound=0, upBound=float(cap[day]) * float(emergency_share))
+    emergency_expr = pulp.lpSum(float(emergency_cost or 0.0) * extra[day] for day in extra) if extra else 0
     # A tiny weight prefers drawing usable inventory before burning line capacity.
     # It is far smaller than any ringgit consequence, so it cannot change who is served.
-    problem += pulp.lpSum(demand["unit_expected_rm"] * unserved[int(demand["id"])] for demand in demands) + (
-        1e-4 * pulp.lpSum(production.values())
-    )
+    problem += business + emergency_expr + (1e-4 * pulp.lpSum(production.values()))
 
     for demand in demands:
         demand_id = int(demand["id"])
@@ -348,13 +500,29 @@ def _solve_lp(demands: list[dict], days: list[str], cap: dict[str, float], usabl
     for day in days:
         users = [production[int(demand["id"]), day] for demand in demands if day <= demand["required_date"]]
         if users:
-            problem += pulp.lpSum(users) <= cap[day], f"cap_{day.replace('-', '')}"
+            ceiling = cap[day] + (extra[day] if day in extra else 0)
+            problem += pulp.lpSum(users) <= ceiling, f"cap_{day.replace('-', '')}"
 
     problem += pulp.lpSum(inventory_use.values()) <= usable, "inventory"
 
-    status = problem.solve(pulp.PULP_CBC_CMD(msg=False))
-    if pulp.LpStatus[status] != "Optimal":
-        raise RuntimeError(f"Allocation solver returned {pulp.LpStatus[status]}.")
+    def _finish(status_name: str) -> None:
+        if pulp.LpStatus[status_name] != "Optimal":
+            raise RuntimeError(f"Allocation solver returned {pulp.LpStatus[status_name]}.")
+
+    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_SECONDS)
+    status = problem.solve(solver)
+    _finish(status)
+    best = float(pulp.value(business) or 0.0)
+    if lex and epsilon >= 0 and partials and not extra:
+        problem += business <= best + float(epsilon), "epsilon_band"
+        problem.setObjective(pulp.lpSum(partials))
+        status = problem.solve(solver)
+        _finish(status)
+        best_partials = float(pulp.value(pulp.lpSum(partials)) or 0.0)
+        problem += pulp.lpSum(partials) <= best_partials + 0.01, "partial_band"
+        problem.setObjective(pulp.lpSum(date_weight))
+        status = problem.solve(solver)
+        _finish(status)
 
     plan: dict[int, dict] = {}
     for demand in demands:
@@ -380,6 +548,11 @@ def _solve_lp(demands: list[dict], days: list[str], cap: dict[str, float], usabl
             "from_production": round_m3(made),
             "by_day": by_day,
         }
+    _solve_lp.last_meta = {  # type: ignore[attr-defined]
+        "status": pulp.LpStatus[status],
+        "time_limit_seconds": SOLVER_TIME_LIMIT_SECONDS,
+        "emergency_m3": round_m3(sum(float(pulp.value(extra[day]) or 0.0) for day in extra)),
+    }
     return plan
 
 
@@ -424,6 +597,82 @@ def _greedy(demands: list[dict], days: list[str], cap: dict[str, float], usable:
             "by_day": [],
         }
     return plan
+
+
+def _supply_by_date(days: list[str], cap: dict[str, float], inventory: float, required_date: str) -> float:
+    return float(inventory) + sum(float(cap[day]) for day in days if day <= required_date)
+
+
+def _draw(days: list[str], cap: dict[str, float], inventory: float, required_date: str, qty: float) -> tuple[float, float, float]:
+    """Take up to qty from inventory then dated capacity. Returns allocated, inventory left, and production taken."""
+    need = float(qty)
+    from_inv = min(need, inventory)
+    inventory -= from_inv
+    need -= from_inv
+    from_prod = 0.0
+    for day in days:
+        if day > required_date or need <= TOL:
+            break
+        take = min(need, cap[day])
+        cap[day] -= take
+        need -= take
+        from_prod += take
+    return float(qty) - max(need, 0.0), inventory, from_prod
+
+
+def _parent_greedy(parents: list[dict], days: list[str], cap: dict[str, float], usable: float, policy: str) -> dict[int, dict]:
+    """Fill whole orders. Dates limit production. Complete-or-skip refuses a lump-sum it cannot finish."""
+    remaining_cap = dict(cap)
+    remaining_inv = usable
+    if policy == "unit_expected":
+        ordered = sorted(parents, key=lambda row: (-float(row["unit_expected_rm"]), row["required_date"], int(row["id"])))
+    elif policy == "earliest":
+        ordered = sorted(parents, key=lambda row: (row["required_date"], -float(row["unit_expected_rm"]), int(row["id"])))
+    else:
+        ordered = sorted(parents, key=lambda row: (-exposure_per_m3(row), row["required_date"], int(row["id"])))
+    plan: dict[int, dict] = {}
+    for demand in ordered:
+        requested = float(demand["quantity"])
+        confirmed = min(max(float(demand.get("confirmed_quantity") or 0.0), 0.0), requested)
+        skip = False
+        if policy == "complete_or_skip" and penalty_type_of(demand) == "lump_sum" and confirmed > TOL:
+            if _supply_by_date(days, remaining_cap, remaining_inv, str(demand["required_date"])) + TOL < confirmed:
+                skip = True
+        if skip:
+            plan[int(demand["id"])] = {
+                "allocated": 0.0,
+                "unserved": round_m3(requested),
+                "from_inventory": 0.0,
+                "from_production": 0.0,
+                "by_day": [],
+            }
+            continue
+        allocated, remaining_inv, from_prod = _draw(days, remaining_cap, remaining_inv, str(demand["required_date"]), requested)
+        allocated = _snap(allocated, requested)
+        plan[int(demand["id"])] = {
+            "allocated": allocated,
+            "unserved": round_m3(requested - allocated),
+            "from_inventory": round_m3(allocated - from_prod) if allocated + TOL >= from_prod else round_m3(allocated),
+            "from_production": round_m3(min(from_prod, allocated)),
+            "by_day": [],
+        }
+    return plan
+
+
+def _score_parent_plan(parents: list[dict], raw_plan: dict[int, dict]) -> dict[int, dict]:
+    scored: dict[int, dict] = {}
+    for demand in parents:
+        demand_id = int(demand["id"])
+        slot = raw_plan.get(demand_id) or {
+            "allocated": 0.0,
+            "unserved": float(demand["quantity"]),
+            "from_inventory": 0.0,
+            "from_production": 0.0,
+            "by_day": [],
+        }
+        money = score_parent_unserved(demand, float(slot["unserved"]))
+        scored[demand_id] = {**slot, "impact_override": money}
+    return scored
 
 
 def _line_view(demand: dict, slot: dict, rank: int, emergency: float, emergency_is_assumption: bool) -> dict:
@@ -685,7 +934,7 @@ def _narrative(plant: str, product: str, supply: dict, lines: list[dict], polici
             tradeoff += (
                 f" {challenger['customer_or_project']} is due on {_pretty(challenger['required_date'])}, earlier than "
                 f"{marginal['customer_or_project']} on {_pretty(marginal['required_date'])}. "
-                f"Earliness is a production constraint, not a priority rule."
+                f"Earliness breaks a tie only inside the RM{OBJECTIVE_EPSILON_RM:.0f} band, after partially served orders have been minimised. Outside that band it does not take cubic metres from a higher expected consequence."
             )
     policy_text = (
         f"On the same capacity, the current-practice proxy (illustrative, not observed history) leaves expected consequence of {_rm(practice['expected_consequence_rm'])}. "
@@ -740,7 +989,243 @@ def _windows(demands: list[dict], days: list[str], cap: dict[str, float], usable
     return windows
 
 
-def solve_bucket(world: dict, plant_id: int, product_id: int, plans: dict | None = None) -> dict:
+def _is_safer(row: dict) -> bool:
+    penalty = float(row.get("contractual_penalty_rm") or row.get("contractual_penalty") or 0)
+    return row.get("demand_type") == "External" and row.get("confidence_level") == "Confirmed" and penalty > 1
+
+
+def _tie_notes(lines: list[dict]) -> list[str]:
+    """Close calls between a served order and a different unserved order."""
+    served = [line for line in lines if line["allocated_quantity"] > TOL]
+    missed = [line for line in lines if line["unserved_quantity"] > TOL]
+    notes = []
+    seen: set[tuple[str, str]] = set()
+    for left in missed:
+        for right in served:
+            if left["demand_code"] == right["demand_code"]:
+                continue
+            pair = tuple(sorted((left["demand_code"], right["demand_code"])))
+            if pair in seen:
+                continue
+            gap = abs(float(left["unit_expected_rm"]) - float(right["unit_expected_rm"]))
+            if gap > TIE_TOLERANCE_RM + 0.01:
+                continue
+            seen.add(pair)
+            left_flag = _is_safer(left)
+            right_flag = _is_safer(right)
+            if left_flag and right_flag:
+                notes.append(
+                    f"{left['customer_or_project']} and {right['customer_or_project']} differ by {_rm(gap)} per m³, "
+                    f"inside the {_rm(TIE_TOLERANCE_RM)} tie tolerance. Both are confirmed external orders with a contractual penalty, "
+                    "so the tie-break does not choose between them. The linear programme keeps the higher unit expected consequence."
+                )
+            elif left_flag and not right_flag:
+                notes.append(
+                    f"{left['customer_or_project']} and {right['customer_or_project']} differ by {_rm(gap)} per m³, "
+                    f"inside the {_rm(TIE_TOLERANCE_RM)} tie tolerance. {left['customer_or_project']} is a confirmed external order "
+                    "with a contractual penalty, so the recommendation prefers it."
+                )
+            elif right_flag and not left_flag:
+                notes.append(
+                    f"{right['customer_or_project']} and {left['customer_or_project']} differ by {_rm(gap)} per m³, "
+                    f"inside the {_rm(TIE_TOLERANCE_RM)} tie tolerance. The recommendation keeps "
+                    f"{right['customer_or_project']} because it is a confirmed external order with a contractual penalty."
+                )
+    return notes
+
+
+def _prefer_contractually_safer(
+    raw_demands: list[dict],
+    days: list[str],
+    cap: dict[str, float],
+    usable: float,
+    plans: dict[str, dict[int, dict]],
+) -> tuple[dict[str, dict[int, dict]], str]:
+    """Swap only when a safer order is short and a less-safe order is served inside the tolerance."""
+    parents = _prepare_demands(raw_demands)
+    plan = plans["optimised"]
+    served = []
+    missed = []
+    for parent in parents:
+        slot = plan[int(parent["id"])]
+        if slot["unserved"] > TOL:
+            missed.append(parent)
+        if slot["allocated"] > TOL:
+            served.append(parent)
+    chosen = None
+    for safer in missed:
+        if not _is_safer(safer):
+            continue
+        for other in served:
+            if _is_safer(other):
+                continue
+            gap = abs(float(safer["unit_expected_rm"]) - float(other["unit_expected_rm"]))
+            if gap <= TIE_TOLERANCE_RM + 0.01 and float(safer["unit_expected_rm"]) <= float(other["unit_expected_rm"]) + 0.01:
+                chosen = (safer, other, gap)
+                break
+        if chosen:
+            break
+    if chosen is None:
+        return plans, ""
+    safer, other, gap = chosen
+    bonus_amount = float(other["unit_expected_rm"]) - float(safer["unit_expected_rm"]) + 0.05
+    tranches = _prepare_demands([row for demand in raw_demands for row in expand_tranches(demand)])
+    bonus = {
+        int(tranche["id"]): bonus_amount
+        for tranche in tranches
+        if int(tranche["parent_id"]) == int(safer["id"])
+    }
+    updated = _collapse_plan(parents, tranches, _solve_lp(tranches, days, cap, usable, unit_bonus=bonus))
+    if updated[int(safer["id"])]["allocated"] <= plan[int(safer["id"])]["allocated"] + TOL:
+        return plans, (
+            f"{safer['customer_or_project']} and {other['customer_or_project']} differ by {_rm(gap)} per m³, "
+            f"inside the {_rm(TIE_TOLERANCE_RM)} tie tolerance. {safer['customer_or_project']} is the contractually safer order, "
+            f"but its required date cannot take the cubic metres already given to {other['customer_or_project']}."
+        )
+    replaced = dict(plans)
+    replaced["optimised"] = updated
+    return replaced, (
+        f"{safer['customer_or_project']} and {other['customer_or_project']} differ by {_rm(gap)} per m³, "
+        f"inside the {_rm(TIE_TOLERANCE_RM)} tie tolerance. {safer['customer_or_project']} is a confirmed external order "
+        f"with a contractual penalty, so the recommendation serves it ahead of {other['customer_or_project']}. "
+        f"The extra expected consequence of that choice is about {_rm(gap)} per m³."
+    )
+
+
+def _lump_groups(raw_demands: list[dict]) -> list[dict]:
+    ranked = sorted(
+        (row for row in raw_demands if float(row.get("contractual_penalty") or 0) > 1),
+        key=lambda row: -float(row["contractual_penalty"]),
+    )
+    groups = []
+    for demand in list(ranked)[:LUMP_SUM_TOP_N]:
+        parent_id = int(demand["id"])
+        pieces = expand_tranches(demand)
+        factor = float(CONFIDENCE_FACTOR.get(str(demand.get("confidence_level") or "Confirmed"), 1.0))
+        groups.append(
+            {
+                "parent_id": parent_id,
+                "tranche_ids": [int(row["id"]) for row in pieces],
+                "parent_quantity": float(demand["requested_quantity"]),
+                "penalty_expected_rm": float(demand["contractual_penalty"]) * factor,
+                "demand_code": demand["demand_code"],
+                "customer_or_project": demand["customer_or_project"],
+            }
+        )
+    return groups
+
+
+def _plan_expected(plan: dict | None) -> float:
+    if not plan:
+        return 0.0
+    return round_rm(sum(float(slot["impact_override"]["expected_consequence_rm"]) for slot in plan.values()))
+
+
+def _allocation_rows(demands: list[dict], plan: dict | None) -> list[dict]:
+    if not plan:
+        return []
+    rows = []
+    for demand in demands:
+        slot = plan[int(demand["id"])]
+        rows.append(
+            {
+                "demand_id": int(demand["id"]),
+                "demand_code": demand["demand_code"],
+                "customer_or_project": demand["customer_or_project"],
+                "demand_type": demand["demand_type"],
+                "allocated_m3": slot["allocated"],
+                "unserved_m3": slot["unserved"],
+                "expected_consequence_rm": slot["impact_override"]["expected_consequence_rm"],
+            }
+        )
+    return rows
+
+
+def _linear_score(demands: list[dict], plan: dict) -> float:
+    total = 0.0
+    for demand in demands:
+        total += score_parent_unserved(
+            demand,
+            plan[int(demand["id"])]["unserved"],
+            penalty_as="per_m3",
+            delay_as="proportional",
+        )["expected_consequence_rm"]
+    return round_rm(total)
+
+
+def _regret_comparison(demands: list[dict], typed: dict, proportional: dict | None) -> dict:
+    typed_true = _plan_expected(typed)
+    if proportional is None:
+        return {
+            "typed_plan_true_rm": typed_true,
+            "plans_differ": False,
+            "note": "This bucket was solved on a shared ready-mix plan.",
+        }
+    prop_true = _plan_expected(proportional)
+    differ = any(
+        abs(float(typed[int(demand["id"])]["allocated"]) - float(proportional[int(demand["id"])]["allocated"])) > TOL
+        for demand in demands
+    )
+    return {
+        "typed_plan_true_rm": typed_true,
+        "proportional_plan_true_rm": prop_true,
+        "proportional_regret_under_true_terms_rm": round_rm(prop_true - typed_true),
+        "typed_plan_if_scored_proportional_rm": _linear_score(demands, typed),
+        "proportional_plan_if_scored_proportional_rm": _linear_score(demands, proportional),
+        "plans_differ": differ,
+        "typed_allocations": _allocation_rows(demands, typed),
+        "proportional_allocations": _allocation_rows(demands, proportional),
+        "note": (
+            "The recommendation is the mixed-integer plan under each order's own penalty type and delay type. "
+            "The proportional plan is a labelled comparison that treats every penalty and every delay as linear. "
+            "Regret is that comparison's consequence under the true terms, minus the recommendation."
+        ),
+    }
+
+
+def _party_slice(demands: list[dict], plan: dict, linear: bool) -> dict:
+    buckets = {
+        "Internal": {"unserved_m3": 0.0, "consequence_rm": 0.0},
+        "External": {"unserved_m3": 0.0, "consequence_rm": 0.0},
+    }
+    for demand in demands:
+        slot = plan[int(demand["id"])]
+        kind = demand["demand_type"] if demand["demand_type"] in buckets else "External"
+        buckets[kind]["unserved_m3"] += float(slot["unserved"])
+        if linear:
+            buckets[kind]["consequence_rm"] += score_parent_unserved(
+                demand, slot["unserved"], penalty_as="per_m3", delay_as="proportional"
+            )["expected_consequence_rm"]
+        else:
+            buckets[kind]["consequence_rm"] += float(slot["impact_override"]["expected_consequence_rm"])
+    unserved = buckets["Internal"]["unserved_m3"] + buckets["External"]["unserved_m3"]
+    consequence = buckets["Internal"]["consequence_rm"] + buckets["External"]["consequence_rm"]
+    for side in buckets.values():
+        side["unserved_m3"] = round_m3(side["unserved_m3"])
+        side["consequence_rm"] = round_rm(side["consequence_rm"])
+        side["unserved_share"] = round(side["unserved_m3"] / unserved, 4) if unserved > TOL else 0.0
+        side["consequence_share"] = round(side["consequence_rm"] / consequence, 4) if consequence > 1 else 0.0
+    return {"internal": buckets["Internal"], "external": buckets["External"]}
+
+
+def _party_burden(demands: list[dict], typed: dict, proportional: dict | None) -> dict:
+    return {
+        "before": _party_slice(demands, proportional, True) if proportional else None,
+        "after": _party_slice(demands, typed, False),
+        "note": "Before is the all-proportional plan scored as linear. After is the recommendation scored on each order's own penalty and delay type.",
+    }
+
+
+def solve_bucket(
+    world: dict,
+    plant_id: int,
+    product_id: int,
+    plans: dict | None = None,
+    *,
+    include_comparison: bool = True,
+    include_expedite: bool = True,
+    lex: bool = True,
+) -> dict:
     plant = _plant(world, plant_id)
     product = _product(world, product_id)
     days = sorted(
@@ -764,14 +1249,76 @@ def solve_bucket(world: dict, plant_id: int, product_id: int, plans: dict | None
     demands = _prepare_demands(raw_demands)
     emergency = float(product["emergency_cost_per_m3"])
     assumption = bool(product["emergency_cost_is_assumption"])
+    recommendation_basis = "typed_milp"
+    minimax = None
+    proportional_plan = None
     if plans is None:
-        plans = _plans_for(raw_demands, days, cap, usable)
+        plans = _plans_for(raw_demands, days, cap, usable, lex=lex)
+        if include_comparison:
+            proportional_plans = _plans_for(raw_demands, days, cap, usable, force_penalty="per_m3", force_delay="proportional")
+            proportional_plan = proportional_plans["optimised"]
+        unverified = [row for row in raw_demands if penalty_unverified(row)]
+        if unverified:
+            recommendation_basis = "minimax_unverified"
+            as_linear = {int(row["id"]): "per_m3" for row in unverified}
+            as_lump = {int(row["id"]): "lump_sum" for row in unverified}
+            parents, tranches = _expanded(raw_demands)
+            linear_tranches = _solve_lp(tranches, days, cap, usable, penalty_overrides=as_linear)
+            lump_tranches = _solve_lp(tranches, days, cap, usable, penalty_overrides=as_lump)
+            scored = {
+                "linear_plan_as_linear": _collapse_plan(parents, tranches, linear_tranches, penalty_as=as_linear),
+                "linear_plan_as_lump": _collapse_plan(parents, tranches, linear_tranches, penalty_as=as_lump),
+                "lump_plan_as_linear": _collapse_plan(parents, tranches, lump_tranches, penalty_as=as_linear),
+                "lump_plan_as_lump": _collapse_plan(parents, tranches, lump_tranches, penalty_as=as_lump),
+            }
+            cells = {key: _plan_expected(value) for key, value in scored.items()}
+            best_linear = min(cells["linear_plan_as_linear"], cells["lump_plan_as_linear"])
+            best_lump = min(cells["linear_plan_as_lump"], cells["lump_plan_as_lump"])
+            regret_linear = max(cells["linear_plan_as_linear"] - best_linear, cells["linear_plan_as_lump"] - best_lump)
+            regret_lump = max(cells["lump_plan_as_linear"] - best_linear, cells["lump_plan_as_lump"] - best_lump)
+            choose_lump = regret_lump < regret_linear - 0.01
+            plans["optimised"] = scored["lump_plan_as_lump"] if choose_lump else scored["linear_plan_as_linear"]
+            minimax = {
+                "orders": [row["customer_or_project"] for row in unverified],
+                "cells_rm": cells,
+                "max_regret_linear_plan_rm": round_rm(regret_linear),
+                "max_regret_lump_plan_rm": round_rm(regret_lump),
+                "chosen": "lump_sum" if choose_lump else "per_m3",
+                "note": "These orders are flagged penalty type unverified. The recommendation is the plan with the lower maximum regret across the two readings of that penalty.",
+            }
     optimised_plan = plans["optimised"]
     policies = [
-        _policy_block("optimised", "Minimise business consequence", "Linear programme (CBC)", demands, plans["optimised"], emergency, assumption),
+        _policy_block("optimised", "Minimise business consequence", "Mixed-integer programme (CBC) under each order's penalty and delay type", demands, plans["optimised"], emergency, assumption),
         _policy_block("internal", "Internal projects first", "Priority rule on the same capacity", demands, plans["internal"], emergency, assumption),
         _policy_block("external", "External customers first", "Priority rule on the same capacity", demands, plans["external"], emergency, assumption),
-        _policy_block("earliest", "Earliest required date", "Priority rule on the same capacity", demands, plans["earliest"], emergency, assumption),
+        _policy_block("earliest", "Earliest required date", "Priority rule on the same capacity. Second comparison.", demands, plans["earliest"], emergency, assumption),
+        _policy_block(
+            "penalty_delay",
+            "Penalty and delay per m³",
+            "Greedy rank by average penalty plus delay per cubic metre. Dates limit production.",
+            demands,
+            plans["penalty_delay"],
+            emergency,
+            assumption,
+        ),
+        _policy_block(
+            "complete_or_skip",
+            "Complete or skip lump-sum orders",
+            "A lump-sum order is served only when its full confirmed quantity fits. Otherwise it is skipped.",
+            demands,
+            plans["complete_or_skip"],
+            emergency,
+            assumption,
+        ),
+        _policy_block(
+            "unit_expected",
+            "Greedy unit expected consequence",
+            "Rank by unit expected consequence. No lump split and no confirmed-tranche preference.",
+            demands,
+            plans["unit_expected"],
+            emergency,
+            assumption,
+        ),
         _policy_block(
             "practice",
             "Current practice proxy",
@@ -788,6 +1335,22 @@ def solve_bucket(world: dict, plant_id: int, product_id: int, plans: dict | None
     windows = _windows(demands, days, cap, usable)
     _reasons(lines, windows)
     lines.sort(key=lambda row: (row["rank_by_expected_consequence"]))
+    by_demand = {int(row["id"]): row for row in demands}
+    for line in lines:
+        parent = by_demand[int(line["demand_id"])]
+        full = score_parent_unserved(parent, float(parent["requested_quantity"]))
+        current = score_parent_unserved(parent, float(line["unserved_quantity"]))
+        full_steps = full["penalty_at_risk_rm"] + full["delay_cost_incurred_rm"]
+        current_steps = current["penalty_at_risk_rm"] + current["delay_cost_incurred_rm"]
+        partial = line["allocated_quantity"] > TOL and line["unserved_quantity"] > TOL
+        line["partial_service_no_penalty_avoided"] = bool(partial and abs(full_steps - current_steps) < 1.0)
+        minimum = float(parent.get("minimum_useful_delivery_m3") or 0.0)
+        line["minimum_useful_delivery_m3"] = round_m3(minimum)
+        line["below_minimum_useful_delivery"] = bool(minimum > TOL and TOL < line["allocated_quantity"] < minimum - TOL)
+        if line["partial_service_no_penalty_avoided"]:
+            line["reason"] = (
+                f"{line['reason']} Partial service, no penalty avoided: the cubic metres served leave the penalty and delay unchanged versus missing the order. They earn margin only."
+            ).strip()
     totals = _totals(lines)
     available_capacity = sum(cap.values())
     total_demand = sum(row["quantity"] for row in demands)
@@ -813,6 +1376,7 @@ def solve_bucket(world: dict, plant_id: int, product_id: int, plans: dict | None
         advice = expedite_advice(demand, optimised_plan[int(demand["id"])]["unserved"], emergency, assumption)
         if advice:
             expedites.append(advice)
+    expedites.sort(key=lambda row: (-float(row.get("avoided_per_rm") or 0), row["customer_or_project"]))
     inventory_used = round_m3(sum(slot["from_inventory"] for slot in optimised_plan.values()))
     supply = {
         "available_capacity_m3": round_m3(available_capacity),
@@ -838,6 +1402,105 @@ def solve_bucket(world: dict, plant_id: int, product_id: int, plans: dict | None
                 f"{_m3(stranded)} of {product['name']} capacity at {plant['name']} falls after {_pretty(latest)}. "
                 f"Later orders can still use it. It cannot be brought back onto an order whose required date has passed."
             )
+    explanation = _narrative(plant["name"], product["name"], supply, lines, policies, expedites, maintenance, windows)
+    tie = (
+        f"Inside {_rm(OBJECTIVE_EPSILON_RM)} of the best expected consequence, the solver minimises the number of partially served orders, "
+        f"then leaves the later order unserved. Earliness is that last tie-break. It does not override a gap larger than {_rm(OBJECTIVE_EPSILON_RM)}."
+    )
+    explanation["tie_break"] = tie
+    explanation["tradeoff"] = f"{explanation['tradeoff']} {tie}".strip()
+    explanation["why"] = f"{explanation['why']} {tie}".strip()
+    comparison = _regret_comparison(demands, optimised_plan, proportional_plan)
+    party = _party_burden(demands, optimised_plan, proportional_plan)
+    recommended_true = totals["expected_consequence_rm"]
+    rule_rows = [row for row in policies if row["policy_code"] in SIMPLE_RULES]
+    best_rule = min(rule_rows, key=lambda row: (row["expected_consequence_rm"], SIMPLE_RULES.index(row["policy_code"])))
+    earliest_linear = _linear_score(demands, plans["earliest"])
+    recommended_linear = comparison.get("typed_plan_if_scored_proportional_rm", recommended_true)
+    raw_gap = best_rule["expected_consequence_rm"] - recommended_true
+    # The lexicographic tie-break may leave the recommendation up to the epsilon
+    # above a feasible simple rule. Inside that band the reported gap is zero.
+    gap_true = round_rm(max(0.0, raw_gap) if raw_gap >= -OBJECTIVE_EPSILON_RM - 0.05 else raw_gap)
+    gap_linear = round_rm(earliest_linear - recommended_linear)
+    headline = {
+        "true_rm": gap_true,
+        "best_rule": best_rule["policy_code"],
+        "best_rule_label": best_rule["policy"],
+        "rules": [
+            {
+                "policy_code": row["policy_code"],
+                "label": row["policy"],
+                "expected_consequence_rm": row["expected_consequence_rm"],
+                "gap_rm": round_rm(row["expected_consequence_rm"] - recommended_true),
+            }
+            for row in rule_rows
+        ],
+        "if_scored_proportional_rm": gap_linear,
+        "effect_rm": round_rm(gap_true - gap_linear),
+        "note": (
+            "The headline gap is the lowest simple-rule consequence minus the recommendation, both scored on each order's own penalty and delay type. "
+            f"On this plant and product the best simple rule is {best_rule['policy']}. "
+            "The proportional figure scores the earliest-date allocation and the recommendation as if every term were linear."
+        ),
+    }
+    if include_expedite:
+        parents, tranches = _expanded(raw_demands)
+        emergency_tranches = _solve_lp(
+            tranches,
+            days,
+            cap,
+            usable,
+            lex=False,
+            emergency_cost=emergency,
+            emergency_share=EMERGENCY_CAPACITY_SHARE,
+        )
+        emergency_meta = dict(getattr(_solve_lp, "last_meta", {}))
+        emergency_plan = _collapse_plan(parents, tranches, emergency_tranches)
+        emergency_expected = round_rm(sum(float(slot["impact_override"]["expected_consequence_rm"]) for slot in emergency_plan.values()))
+        emergency_m3 = float(emergency_meta.get("emergency_m3") or 0.0)
+        emergency_cost_rm = round_rm(emergency_m3 * emergency)
+        emergency_avoided = round_rm(recommended_true - emergency_expected)
+        emergency_changes = []
+        for demand in demands:
+            demand_id = int(demand["id"])
+            before = float(optimised_plan[demand_id]["allocated"])
+            after = float(emergency_plan[demand_id]["allocated"])
+            if abs(before - after) > TOL:
+                emergency_changes.append(
+                    {
+                        "customer_or_project": demand["customer_or_project"],
+                        "allocated_before_m3": round_m3(before),
+                        "allocated_after_m3": round_m3(after),
+                    }
+                )
+    else:
+        emergency_m3 = 0.0
+        emergency_cost_rm = 0.0
+        emergency_avoided = 0.0
+        emergency_changes = []
+    change_text = ""
+    if emergency_changes:
+        bits = [
+            f"{row['customer_or_project']} moves from {_m3(row['allocated_before_m3'])} to {_m3(row['allocated_after_m3'])}"
+            for row in emergency_changes
+        ]
+        change_text = " With the extra supply the allocation changes: " + "; ".join(bits) + "."
+    expedite_proposal = {
+        "extra_m3": round_m3(emergency_m3),
+        "cost_rm": emergency_cost_rm,
+        "avoids_rm": emergency_avoided,
+        "net_benefit_rm": round_rm(emergency_avoided - emergency_cost_rm),
+        "recommended": emergency_m3 > TOL and emergency_avoided > emergency_cost_rm + 0.01,
+        "needs_approval": True,
+        "bound_share": EMERGENCY_CAPACITY_SHARE,
+        "changes": emergency_changes,
+        "note": (
+            f"Optional emergency supply, capped at {EMERGENCY_CAPACITY_SHARE:.0%} of each day's available capacity, "
+            "priced at the assumed emergency cost. It is not in the base plan. A person approves it."
+            + change_text
+        ),
+    }
+    solver_meta = dict(getattr(_plans_for, "base_meta", {"status": "Optimal", "time_limit_seconds": SOLVER_TIME_LIMIT_SECONDS}))
     return {
         "plant_id": plant_id,
         "plant_name": plant["name"],
@@ -860,9 +1523,18 @@ def solve_bucket(world: dict, plant_id: int, product_id: int, plans: dict | None
         "maintenance": maintenance,
         "stranded_capacity_m3": round_m3(stranded),
         "stranded_note": stranded_note,
-        "explanation": _narrative(plant["name"], product["name"], supply, lines, policies, expedites, maintenance, windows),
-        "objective": "Minimise expected contribution margin at risk + contractual penalty + programme delay cost, subject to dated plant capacity, usable inventory, product compatibility, and required dates.",
-        "solver": "CBC linear programme",
+        "explanation": explanation,
+        "objective": "Minimise expected consequence under each order's penalty type and delay type, subject to dated plant capacity, usable inventory, product compatibility, and required dates.",
+        "solver": "CBC mixed-integer programme",
+        "solver_status": solver_meta.get("status", "Optimal"),
+        "solver_time_limit_seconds": solver_meta.get("time_limit_seconds", SOLVER_TIME_LIMIT_SECONDS),
+        "objective_epsilon_rm": OBJECTIVE_EPSILON_RM,
+        "expedite_proposal": expedite_proposal,
+        "recommendation_basis": recommendation_basis,
+        "comparison": comparison,
+        "unverified_minimax": minimax,
+        "party_burden": party,
+        "headline_gap": headline,
         "decision_review": review_case(
             totals["programme_days"],
             totals["expected_consequence_rm"],
@@ -885,6 +1557,197 @@ def solve_bucket(world: dict, plant_id: int, product_id: int, plans: dict | None
                 )
             ),
         },
+    }
+
+
+def _unserved_codes(bucket: dict) -> set[str]:
+    return {line["demand_code"] for line in bucket["allocations"] if line["unserved_quantity"] > TOL}
+
+
+def _order_names(bucket: dict, codes: set[str] | list[str]) -> str:
+    lookup = {line["demand_code"]: line["customer_or_project"] for line in bucket["allocations"]}
+    labels = [lookup.get(code, code) for code in sorted(codes)]
+    return ", ".join(labels)
+
+
+def _score_fixed(demands: list[dict], unserved_by_id: dict[int, float]) -> float:
+    total = 0.0
+    for demand in demands:
+        total += score_parent_unserved(demand, float(unserved_by_id.get(int(demand["id"]), demand["requested_quantity"])))[
+            "expected_consequence_rm"
+        ]
+    return round_rm(total)
+
+
+def assess_fragility(plant_id: int, product_id: int) -> dict:
+    """Fragile when the base allocation's regret under a 10% or 20% shock exceeds the bar."""
+    world = load_world()
+    base = solve_bucket(world, plant_id, product_id, include_comparison=False, include_expedite=False)
+    base_set = _unserved_codes(base)
+    base_unserved = {int(line["demand_id"]): float(line["unserved_quantity"]) for line in base["allocations"]}
+    raw = [row for row in world["demands"] if row["plant_id"] == plant_id and row["product_id"] == product_id]
+    checks = []
+    if base["constrained"]:
+        for demand in raw:
+            for factor in SENSITIVITY_FACTORS:
+                scenario = {
+                    "name": "Sensitivity",
+                    "demand_adjustments": [
+                        {"demand_id": int(demand["id"]), "unit_expected_factor": factor},
+                    ],
+                }
+                shocked = apply_scenario(world, scenario)
+                alt = solve_bucket(shocked, plant_id, product_id, include_comparison=False, include_expedite=False)
+                alt_set = _unserved_codes(alt)
+                shocked_demands = [row for row in shocked["demands"] if row["plant_id"] == plant_id and row["product_id"] == product_id]
+                base_cost = _score_fixed(shocked_demands, base_unserved)
+                optimum = float(alt["expected_consequence_rm"])
+                regret = round_rm(base_cost - optimum)
+                threshold = max(FRAGILITY_REGRET_RM, FRAGILITY_REGRET_SHARE * max(optimum, 0.0))
+                checks.append(
+                    {
+                        "demand_code": demand["demand_code"],
+                        "customer_or_project": demand["customer_or_project"],
+                        "factor": factor,
+                        "change_pct": int(round((factor - 1) * 100)),
+                        "unserved_set_changed": alt_set != base_set,
+                        "unserved_after": sorted(alt_set),
+                        "regret_rm": regret,
+                        "threshold_rm": round_rm(threshold),
+                        "exceeds": regret > threshold + 0.01,
+                    }
+                )
+    flips = [row for row in checks if row["exceeds"]]
+    summary, flip_point = _fragility_text(base, flips, checks)
+    share = (len(flips) / len(checks)) if checks else 0.0
+    return {
+        "plant_id": plant_id,
+        "product_id": product_id,
+        "plant_name": base["plant_name"],
+        "product_name": base["product_name"],
+        "fragile": bool(flips),
+        "flip_point": flip_point,
+        "summary": summary,
+        "shock_count": len(checks),
+        "flip_count": len(flips),
+        "flip_share": round(share, 4),
+        "threshold_rm": FRAGILITY_REGRET_RM,
+        "threshold_share": FRAGILITY_REGRET_SHARE,
+        "base_unserved": sorted(base_set),
+        "checks": checks,
+    }
+
+
+def _fragility_text(bucket: dict, flips: list[dict], checks: list[dict]) -> tuple[str, str]:
+    if not bucket["constrained"]:
+        text = "This plant and product can be fully served, so there is no shortfall a 10% or 20% assumption can reprice."
+        return text, ""
+    share = (len(flips) / len(checks)) if checks else 0.0
+    if not flips:
+        text = (
+            f"Not fragile on this grid. {len(checks)} shocks moved one order's unit expected consequence by 10% or 20% "
+            "and the plant-product was solved again. Keeping the base allocation never cost more than "
+            f"RM{FRAGILITY_REGRET_RM:,.0f} or {FRAGILITY_REGRET_SHARE:.0%} of the shocked optimum, whichever is larger. "
+            f"Share of shocks over that bar: {share:.0%}."
+        )
+        return text, ""
+    closest = min(flips, key=lambda row: (abs(int(row["change_pct"])), -float(row["regret_rm"]), row["customer_or_project"]))
+    sign = "+" if int(closest["change_pct"]) > 0 else "-"
+    pct = abs(int(closest["change_pct"]))
+    flip_point = (
+        f"Fragile. {len(flips)} of {len(checks)} shocks ({share:.0%}) put the base plan more than "
+        f"RM{FRAGILITY_REGRET_RM:,.0f} or {FRAGILITY_REGRET_SHARE:.0%} above the re-solved optimum. "
+        f"The largest small step is {closest['customer_or_project']} at {sign}{pct}%, "
+        f"regret {_rm(closest['regret_rm'])}."
+    )
+    same_step = [
+        row
+        for row in flips
+        if row["demand_code"] != closest["demand_code"] and abs(int(row["change_pct"])) == pct
+    ]
+    extra = ""
+    if same_step:
+        bits = []
+        for row in same_step:
+            row_sign = "+" if int(row["change_pct"]) > 0 else "-"
+            bits.append(f"{row['customer_or_project']} at {row_sign}{abs(int(row['change_pct']))}%")
+        extra = " The same grid step also flips " + " and ".join(bits) + "."
+    summary = (
+        flip_point
+        + extra
+        + " Unit expected consequence means margin, contractual penalty, and delay cost scaled together, then solved again."
+    )
+    return summary, flip_point
+
+
+def _lump_penalty_score(bucket: dict, groups: list[dict]) -> float:
+    by_code = {group["demand_code"]: group for group in groups}
+    total = 0.0
+    for line in bucket["allocations"]:
+        group = by_code.get(line["demand_code"])
+        if group and line["unserved_quantity"] > TOL:
+            proportional_penalty = float(line["penalty_at_risk_rm"]) * float(line["confidence_factor"])
+            total += float(line["expected_consequence_rm"]) - proportional_penalty + float(group["penalty_expected_rm"])
+        else:
+            total += float(line["expected_consequence_rm"])
+    return round_rm(total)
+
+
+def compare_lump_sum(plant_id: int, product_id: int) -> dict:
+    """Solve the same plant-product with proportional penalties and with a lump-sum penalty on the top N."""
+    world = load_world()
+    raw = [row for row in world["demands"] if row["plant_id"] == plant_id and row["product_id"] == product_id]
+    groups = _lump_groups(raw)
+    linear = solve_bucket(world, plant_id, product_id)
+    lump_world = deepcopy(world)
+    lump_world["lump_sum_penalties"] = True
+    lump = solve_bucket(lump_world, plant_id, product_id)
+    linear_alloc = {line["demand_code"]: line for line in linear["allocations"]}
+    lump_alloc = {line["demand_code"]: line for line in lump["allocations"]}
+    differences = []
+    for code, line in linear_alloc.items():
+        other = lump_alloc.get(code)
+        if other is None:
+            continue
+        if abs(float(line["allocated_quantity"]) - float(other["allocated_quantity"])) > TOL:
+            differences.append(
+                {
+                    "demand_code": code,
+                    "customer_or_project": line["customer_or_project"],
+                    "linear_allocated_m3": line["allocated_quantity"],
+                    "lump_allocated_m3": other["allocated_quantity"],
+                    "linear_unserved_m3": line["unserved_quantity"],
+                    "lump_unserved_m3": other["unserved_quantity"],
+                }
+            )
+    return {
+        "plant_id": plant_id,
+        "product_id": product_id,
+        "plant_name": linear["plant_name"],
+        "product_name": linear["product_name"],
+        "top_n": LUMP_SUM_TOP_N,
+        "orders": [
+            {
+                "demand_code": group["demand_code"],
+                "customer_or_project": group["customer_or_project"],
+                "penalty_expected_rm": round_rm(group["penalty_expected_rm"]),
+            }
+            for group in groups
+        ],
+        "linear_unserved": sorted(_unserved_codes(linear)),
+        "lump_unserved": sorted(_unserved_codes(lump)),
+        "linear_expected_rm": linear["expected_consequence_rm"],
+        "lump_scored_with_linear_rm": lump["expected_consequence_rm"],
+        "lump_penalty_consequence_rm": _lump_penalty_score(lump, groups),
+        "allocation_changed": bool(differences),
+        "differences": differences,
+        "note": (
+            f"The recommendation on this page stays the proportional penalty. "
+            f"Lump-sum mode is optional. It puts a yes/no variable on the {LUMP_SUM_TOP_N} largest contractual penalties "
+            "and charges the full penalty once any of that order is missed. "
+            "The linear figure scores both allocations with the proportional penalty. "
+            "The lump-sum figure charges the full penalty on those orders when they are short."
+        ),
     }
 
 
@@ -1032,11 +1895,25 @@ def _shared_plans(world: dict, plant_id: int, product_ids: list[int]) -> dict[in
         filled = _greedy_bundles(bundles, policy, shared=True)
         for bundle in bundles:
             plans[bundle["product_id"]][policy] = _collapse_plan(bundle["parents"], bundle["tranches"], filled)
+    for bundle in bundles:
+        for policy in ("penalty_delay", "complete_or_skip", "unit_expected"):
+            plans[bundle["product_id"]][policy] = _score_parent_plan(
+                bundle["parents"],
+                _parent_greedy(bundle["parents"], bundle["days"], bundle["cap"], bundle["usable"], policy),
+            )
     return plans
 
 
-def allocate(scenario: dict | None = None) -> dict:
-    world = apply_scenario(load_world(), scenario)
+def allocate(scenario: dict | None = None, *, include_comparison: bool = True, include_expedite: bool = True, lex: bool = True) -> dict:
+    return allocate_world(
+        apply_scenario(load_world(), scenario),
+        include_comparison=include_comparison,
+        include_expedite=include_expedite,
+        lex=lex,
+    )
+
+
+def allocate_world(world: dict, *, include_comparison: bool = True, include_expedite: bool = True, lex: bool = True) -> dict:
     world["shared_ready_mix_batching"] = bool(world.get("shared_ready_mix_batching", SHARED_READY_MIX_BATCHING))
     buckets = []
     for plant in world["plants"]:
@@ -1045,12 +1922,40 @@ def allocate(scenario: dict | None = None) -> dict:
         if world["shared_ready_mix_batching"] and len(ready) > 1:
             shared = _shared_plans(world, plant["id"], [product["id"] for product in ready])
             for product in ready:
-                buckets.append(solve_bucket(world, plant["id"], product["id"], shared[product["id"]]))
+                buckets.append(
+                    solve_bucket(
+                        world,
+                        plant["id"],
+                        product["id"],
+                        shared[product["id"]],
+                        include_comparison=include_comparison,
+                        include_expedite=include_expedite,
+                        lex=lex,
+                    )
+                )
         else:
             for product in ready:
-                buckets.append(solve_bucket(world, plant["id"], product["id"]))
+                buckets.append(
+                    solve_bucket(
+                        world,
+                        plant["id"],
+                        product["id"],
+                        include_comparison=include_comparison,
+                        include_expedite=include_expedite,
+                        lex=lex,
+                    )
+                )
         for product in others:
-            buckets.append(solve_bucket(world, plant["id"], product["id"]))
+            buckets.append(
+                solve_bucket(
+                    world,
+                    plant["id"],
+                    product["id"],
+                    include_comparison=include_comparison,
+                    include_expedite=include_expedite,
+                    lex=lex,
+                )
+            )
     buckets.sort(key=lambda row: (-row["shortfall_m3"], row["plant_name"], row["product_name"]))
 
     def add(key: str) -> float:
@@ -1080,6 +1985,21 @@ def allocate(scenario: dict | None = None) -> dict:
         "programme_days": round(sum(bucket["programme_days"] for bucket in buckets), 2),
         "value_protected_vs_practice_rm": round_rm(practice_expected - optimised_expected),
         "value_protected_vs_earliest_rm": round_rm(earliest_expected - optimised_expected),
+        "value_protected_vs_best_rule_rm": round_rm(sum(bucket["headline_gap"]["true_rm"] for bucket in buckets)),
+        "best_rule_by_bucket": [
+            {
+                "plant_name": bucket["plant_name"],
+                "product_name": bucket["product_name"],
+                "best_rule": bucket["headline_gap"].get("best_rule"),
+                "best_rule_label": bucket["headline_gap"].get("best_rule_label"),
+                "gap_rm": bucket["headline_gap"]["true_rm"],
+            }
+            for bucket in buckets
+            if bucket["constrained"]
+        ],
+        "headline_gap_if_scored_proportional_rm": round_rm(sum(bucket["headline_gap"]["if_scored_proportional_rm"] for bucket in buckets)),
+        "headline_gap_effect_rm": round_rm(sum(bucket["headline_gap"]["effect_rm"] for bucket in buckets)),
+        "headline_gap_note": buckets[0]["headline_gap"]["note"] if buckets else "",
         "value_protected_vs_internal_first_rm": round_rm(internal_expected - optimised_expected),
         "value_protected_vs_external_first_rm": round_rm(external_expected - optimised_expected),
         "earliest_expected_consequence_rm": round_rm(earliest_expected),
@@ -1092,7 +2012,7 @@ def allocate(scenario: dict | None = None) -> dict:
         "scenario_name": world.get("scenario_name") or "Baseline",
         "scenario_notes": world.get("scenario_notes") or [],
         "horizon": {"start": HORIZON_START, "end": HORIZON_END},
-        "solver": "CBC linear programme",
+        "solver": "CBC mixed-integer programme",
         "objective": buckets[0]["objective"] if buckets else "",
         "assumptions": ASSUMPTIONS,
         "model": {
@@ -1108,7 +2028,7 @@ def allocate(scenario: dict | None = None) -> dict:
                 "Inventory used cannot exceed on-hand minus safety stock.",
                 "No production variable exists after the required date, or on another plant or product.",
             ],
-            "solver": "CBC linear programme, one solve per plant and product.",
+            "solver": "CBC mixed-integer programme. One typed solve per plant and product, plus a labelled all-proportional comparison.",
             "not_in_the_objective": [
                 "Emergency RM per m³ is an expedite screen, not extra base capacity.",
                 "Criticality is a label. It changes the solve only when a scenario rescales delay cost.",
@@ -1168,7 +2088,16 @@ def score_targets(world: dict, plant_id: int, product_id: int, targets: dict[int
     for demand in demands:
         demand_id = int(demand["id"])
         allocated = _snap(float(targets.get(demand_id, 0.0)), demand["quantity"])
-        slot = {"allocated": allocated, "unserved": demand["quantity"] - allocated, "from_inventory": 0, "from_production": allocated, "by_day": []}
+        unserved = demand["quantity"] - allocated
+        impact = score_parent_unserved(demand, unserved)
+        slot = {
+            "allocated": allocated,
+            "unserved": unserved,
+            "from_inventory": 0,
+            "from_production": allocated,
+            "by_day": [],
+            "impact_override": impact,
+        }
         lines.append(_line_view(demand, slot, 0, float(product["emergency_cost_per_m3"]), bool(product["emergency_cost_is_assumption"])))
     return _totals(lines) | {"allocations": lines}
 
@@ -1249,56 +2178,158 @@ def capacity_view(plant_id: int, product_id: int) -> dict:
     }
 
 
-def value_protected_band(base: dict | None = None) -> dict:
-    """Earliest-date gap at 60%, 100%, and 140% penalty and delay cost.
+def _retarget_types(world: dict, mode: str) -> dict:
+    world = deepcopy(world)
+    for demand in world["demands"]:
+        if mode == "linear":
+            demand["penalty_type"] = "per_m3"
+            demand["delay_type"] = "proportional"
+        elif mode == "lump":
+            if float(demand.get("contractual_penalty") or 0) > 0:
+                demand["penalty_type"] = "lump_sum"
+            delay_pool = float(demand.get("delay_days_if_unserved") or 0) * float(demand.get("delay_cost_per_day") or 0)
+            if demand.get("demand_type") == "Internal" and delay_pool > 0:
+                demand["delay_type"] = "lump_days"
+    return world
 
-    Each case is solved again. The 100% case is the headline. The practice
-    proxy gap is reported beside it as an upper bound, not as the headline.
-    """
-    cases = []
-    for factor, label in ((0.6, "low"), (1.0, "base"), (1.4, "high")):
-        if factor == 1.0 and base is not None:
-            result = base
-        else:
-            result = allocate(
-                None
-                if factor == 1.0
-                else {"name": f"Penalty and delay at {factor:.0%}", "penalty_and_delay_factor": factor}
-            )
-        totals = result["totals"]
-        cases.append(
-            {
-                "factor": factor,
-                "label": label,
-                "optimised_expected_rm": totals["expected_consequence_rm"],
-                "earliest_expected_rm": totals["earliest_expected_consequence_rm"],
-                "value_protected_vs_earliest_rm": totals["value_protected_vs_earliest_rm"],
-                "practice_proxy_gap_rm": totals["value_protected_vs_practice_rm"],
-            }
-        )
-    base_case = next(row for row in cases if row["label"] == "base")
+
+def value_protected_band(base: dict | None = None) -> dict:
+    """Headline gap under all-linear, the seeded mix, and all-lump contract types."""
+    if base is None:
+        base = allocate(None, include_comparison=False, include_expedite=False)
+    seeded = float(base["totals"]["value_protected_vs_best_rule_rm"])
+    linear = allocate_world(_retarget_types(load_world(), "linear"), include_comparison=False, include_expedite=False)
+    lump = allocate_world(_retarget_types(load_world(), "lump"), include_comparison=False, include_expedite=False)
+    linear_gap = float(linear["totals"]["value_protected_vs_best_rule_rm"])
+    lump_gap = float(lump["totals"]["value_protected_vs_best_rule_rm"])
+    cases = [
+        {"label": "all_linear", "value_protected_rm": round_rm(linear_gap)},
+        {"label": "seeded", "value_protected_rm": round_rm(seeded)},
+        {"label": "all_lump", "value_protected_rm": round_rm(lump_gap)},
+    ]
     return {
-        "headline_basis": "earliest_required_date",
-        "low_rm": cases[0]["value_protected_vs_earliest_rm"],
-        "base_rm": base_case["value_protected_vs_earliest_rm"],
-        "high_rm": cases[2]["value_protected_vs_earliest_rm"],
+        "headline_basis": "best_simple_rule",
+        "all_linear_rm": round_rm(linear_gap),
+        "seeded_rm": round_rm(seeded),
+        "all_lump_rm": round_rm(lump_gap),
+        "low_rm": round_rm(min(linear_gap, seeded, lump_gap)),
+        "base_rm": round_rm(seeded),
+        "high_rm": round_rm(max(linear_gap, seeded, lump_gap)),
         "cases": cases,
-        "practice_proxy_gap_rm": base_case["practice_proxy_gap_rm"],
+        "practice_proxy_gap_rm": base["totals"]["value_protected_vs_practice_rm"],
         "practice_proxy_note": (
-            "Upper bound only. The proxy ignores programme delay when it ranks orders, "
+            "Footnote. The proxy ignores programme delay when it ranks orders, "
             "then the consequence still includes that delay. It is not current practice and not observed savings."
         ),
+        "earliest_gap_rm": base["totals"]["value_protected_vs_earliest_rm"],
+        "gap_nonnegative_note": (
+            "The recommendation minimises the same objective the gap is scored on, so the gap is at least zero in every contract world. "
+            "The magnitude is meaningful only if the seeded inputs are."
+        ),
         "formula": (
-            "Modelled gap = expected consequence if orders are served earliest-required-date first, "
-            "minus expected consequence of the recommended allocation. "
-            "Both use the same demand, dated capacity, and usable inventory. "
-            "Expected consequence of what is left unserved = "
-            "(contribution margin + contractual penalty + delay days × cost per day) "
-            "× planning-certainty weight × the unserved fraction. "
-            "Low, base, and high set contractual penalty and delay cost per day to 60%, 100%, and 140% of the book, then solve again. "
-            "Contribution margin is not scaled. "
+            "Modelled gap = expected consequence of the best simple rule minus the recommended allocation. "
+            "The simple rules are earliest required date, penalty and delay per cubic metre, complete-or-skip for lump-sum orders, "
+            "and a greedy rank by unit expected consequence. Each plant-product uses whichever scores lowest. "
+            "The range re-solves that gap with every term linear, with the seeded mix, and with every positive term as a lump. "
             "This is a modelled difference on synthetic orders, not observed savings."
         ),
+    }
+
+
+_VOI_CACHE: dict | None = None
+
+
+def value_of_information(base: dict | None = None) -> dict:
+    """Flip each order's contract types, re-solve that bucket, and rank the decision impact."""
+    from app.economics import flip_delay_type, flip_penalty_type, types_unverified
+
+    global _VOI_CACHE
+    if base is None and _VOI_CACHE is not None:
+        return _VOI_CACHE
+    if base is None:
+        base = allocate(None, include_comparison=False, include_expedite=False)
+    world = load_world()
+    base_gap = float(base["totals"]["value_protected_vs_best_rule_rm"])
+    buckets = {(bucket["plant_id"], bucket["product_id"]): bucket for bucket in base["buckets"]}
+    rows = []
+    for demand in world["demands"]:
+        flipped = deepcopy(world)
+        target = next(row for row in flipped["demands"] if int(row["id"]) == int(demand["id"]))
+        old_penalty = str(target.get("penalty_type") or "per_m3")
+        old_delay = str(target.get("delay_type") or "proportional")
+        target["penalty_type"] = flip_penalty_type(old_penalty)
+        target["delay_type"] = flip_delay_type(old_delay)
+        key = (int(demand["plant_id"]), int(demand["product_id"]))
+        current = buckets[key]
+        alt = solve_bucket(flipped, key[0], key[1], include_comparison=False, include_expedite=False)
+        new_gap = round_rm(base_gap - float(current["headline_gap"]["true_rm"]) + float(alt["headline_gap"]["true_rm"]))
+        base_alloc = {int(line["demand_id"]): float(line["allocated_quantity"]) for line in current["allocations"]}
+        moved = sum(abs(float(line["allocated_quantity"]) - base_alloc.get(int(line["demand_id"]), 0.0)) for line in alt["allocations"])
+        m3_moved = round_m3(moved / 2.0)
+        changed = m3_moved > 0.5
+        rows.append(
+            {
+                "demand_id": int(demand["id"]),
+                "demand_code": demand["demand_code"],
+                "customer_or_project": demand["customer_or_project"],
+                "plant_id": key[0],
+                "product_id": key[1],
+                "plant_name": current["plant_name"],
+                "product_name": current["product_name"],
+                "from_penalty_type": old_penalty,
+                "to_penalty_type": target["penalty_type"],
+                "from_delay_type": old_delay,
+                "to_delay_type": target["delay_type"],
+                "types_unverified": bool(types_unverified(demand)),
+                "gap_change_rm": round_rm(new_gap - base_gap),
+                "allocation_changed": changed,
+                "m3_moved": m3_moved,
+                "statement": (
+                    f"This plan changes if {demand['customer_or_project']}'s clause is {target['penalty_type']} / {target['delay_type']}."
+                    if changed
+                    else ""
+                ),
+            }
+        )
+    rows.sort(key=lambda row: (-abs(float(row["gap_change_rm"])), -float(row["m3_moved"]), row["demand_code"]))
+    payload = {
+        "order_count": len(rows),
+        "order_count_note": "One row per demand line. The book has 18 lines. Tranches are not separate orders.",
+        "lines": rows,
+        "note": (
+            "Each line is re-solved on its own plant and product with that order's penalty type and delay type flipped. "
+            "The recommendation and the best simple rule are both solved again. Other plant-products stay on the base solve."
+        ),
+    }
+    _VOI_CACHE = payload
+    return payload
+
+
+def _book_party_burden(buckets: list[dict]) -> dict:
+    sides = {
+        "before": {"internal": {"unserved_m3": 0.0, "consequence_rm": 0.0}, "external": {"unserved_m3": 0.0, "consequence_rm": 0.0}},
+        "after": {"internal": {"unserved_m3": 0.0, "consequence_rm": 0.0}, "external": {"unserved_m3": 0.0, "consequence_rm": 0.0}},
+    }
+    for bucket in buckets:
+        burden = bucket.get("party_burden") or {}
+        for when in ("before", "after"):
+            block = burden.get(when)
+            if not block:
+                continue
+            for party in ("internal", "external"):
+                sides[when][party]["unserved_m3"] += float(block[party]["unserved_m3"])
+                sides[when][party]["consequence_rm"] += float(block[party]["consequence_rm"])
+    for when in sides.values():
+        unserved = when["internal"]["unserved_m3"] + when["external"]["unserved_m3"]
+        consequence = when["internal"]["consequence_rm"] + when["external"]["consequence_rm"]
+        for party in when.values():
+            party["unserved_m3"] = round_m3(party["unserved_m3"])
+            party["consequence_rm"] = round_rm(party["consequence_rm"])
+            party["unserved_share"] = round(party["unserved_m3"] / unserved, 4) if unserved > TOL else 0.0
+            party["consequence_share"] = round(party["consequence_rm"] / consequence, 4) if consequence > 1 else 0.0
+    return {
+        **sides,
+        "note": "Before is the all-proportional plan scored as linear. After is the recommendation scored on each order's own penalty and delay type.",
     }
 
 
@@ -1315,6 +2346,7 @@ def control_tower() -> dict:
         if not bucket["constrained"]:
             continue
         crunch = max(bucket["windows"], key=lambda row: row["gap_m3"])
+        fragility = assess_fragility(bucket["plant_id"], bucket["product_id"])
         hotspots.append(
             {
                 "plant_id": bucket["plant_id"],
@@ -1328,6 +2360,9 @@ def control_tower() -> dict:
                 "expected_consequence_rm": bucket["expected_consequence_rm"],
                 "programme_days": bucket["programme_days"],
                 "why": bucket["explanation"]["tradeoff"] or bucket["explanation"]["summary"],
+                "fragile": fragility["fragile"],
+                "flip_point": fragility["flip_point"],
+                "fragility_summary": fragility["summary"],
             }
         )
     return {
@@ -1351,11 +2386,17 @@ def control_tower() -> dict:
             "penalty_at_risk_rm": totals["penalty_at_risk_rm"],
             "expected_consequence_rm": totals["expected_consequence_rm"],
             "gross_consequence_rm": totals["gross_consequence_rm"],
-            "value_protected_rm": totals["value_protected_vs_earliest_rm"],
+            "value_protected_rm": totals["value_protected_vs_best_rule_rm"],
             "value_protected_vs_earliest_rm": totals["value_protected_vs_earliest_rm"],
-            "value_protected_note": "Modelled gap versus an earliest-required-date rule on the same supply. Not observed savings, and not a record of current practice.",
+            "value_protected_vs_best_rule_rm": totals["value_protected_vs_best_rule_rm"],
+            "best_rule_by_bucket": totals["best_rule_by_bucket"],
+            "value_protected_note": "Modelled gap versus the best simple rule on the same supply. Earliest-date is the second comparison. Not observed savings.",
             "value_protected_range": band,
+            "headline_gap_if_scored_proportional_rm": totals["headline_gap_if_scored_proportional_rm"],
+            "headline_gap_effect_rm": totals["headline_gap_effect_rm"],
+            "headline_gap_note": totals["headline_gap_note"],
             "constrained_buckets": totals["constrained_buckets"],
+            "party_burden": _book_party_burden(result["buckets"]),
         },
         "insight": (
             f"Adding the month together shows a surplus of {_m3(totals['horizon_surplus_m3'])}. "
@@ -1373,9 +2414,12 @@ def control_tower() -> dict:
                 "crunch_date": row["crunch_date"],
                 "shortfall_m3": row["shortfall_m3"],
                 "programme_days": row["programme_days"],
+                "fragile": row["fragile"],
+                "flip_point": row["flip_point"],
                 "text": (
                     f"{row['plant_name']} / {row['product_name']}: dated shortfall {_m3(row['shortfall_m3'])} "
                     f"by {_pretty(row['crunch_date'])}. Programme days left open in the recommendation: {row['programme_days']:g}."
+                    + (f" {row['flip_point']}" if row["fragile"] else " Not fragile on the 10% and 20% grid.")
                 ),
             }
             for row in hotspots

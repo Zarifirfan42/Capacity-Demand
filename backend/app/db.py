@@ -79,7 +79,14 @@ CREATE TABLE IF NOT EXISTS demands (
     delay_cost_per_day REAL NOT NULL,
     source TEXT NOT NULL,
     notes TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    penalty_type TEXT NOT NULL DEFAULT 'per_m3' CHECK (penalty_type IN ('lump_sum', 'per_m3', 'per_day')),
+    delay_type TEXT NOT NULL DEFAULT 'proportional' CHECK (delay_type IN ('lump_days', 'proportional', 'per_day')),
+    penalty_type_unverified INTEGER NOT NULL DEFAULT 0,
+    lump_sum_trigger TEXT NOT NULL DEFAULT 'any',
+    types_unverified INTEGER NOT NULL DEFAULT 1,
+    delay_type_unverified INTEGER NOT NULL DEFAULT 1,
+    minimum_useful_delivery_m3 REAL NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS demand_history (
@@ -140,6 +147,7 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         _ensure_decision_columns(conn)
         _ensure_product_columns(conn)
+        _ensure_demand_columns(conn)
 
 
 def _ensure_decision_columns(conn: sqlite3.Connection) -> None:
@@ -151,10 +159,28 @@ def _ensure_decision_columns(conn: sqlite3.Connection) -> None:
         "actual_note": "TEXT NOT NULL DEFAULT ''",
         "actual_recorded_at": "TEXT",
         "actual_username": "TEXT NOT NULL DEFAULT ''",
+        "chosen_plan": "TEXT NOT NULL DEFAULT ''",
+        "terms_confirmed": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, declaration in additions.items():
         if name not in present:
             conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {declaration}")
+
+
+def _ensure_demand_columns(conn: sqlite3.Connection) -> None:
+    present = {row[1] for row in conn.execute("PRAGMA table_info(demands)").fetchall()}
+    additions = {
+        "penalty_type": "TEXT NOT NULL DEFAULT 'per_m3'",
+        "delay_type": "TEXT NOT NULL DEFAULT 'proportional'",
+        "penalty_type_unverified": "INTEGER NOT NULL DEFAULT 0",
+        "lump_sum_trigger": "TEXT NOT NULL DEFAULT 'any'",
+        "types_unverified": "INTEGER NOT NULL DEFAULT 1",
+        "delay_type_unverified": "INTEGER NOT NULL DEFAULT 1",
+        "minimum_useful_delivery_m3": "REAL NOT NULL DEFAULT 0",
+    }
+    for name, declaration in additions.items():
+        if name not in present:
+            conn.execute(f"ALTER TABLE demands ADD COLUMN {name} {declaration}")
 
 
 def _ensure_product_columns(conn: sqlite3.Connection) -> None:

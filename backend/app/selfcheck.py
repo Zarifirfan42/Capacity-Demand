@@ -33,27 +33,28 @@ def main() -> None:
     assert abs(crunch["gap_m3"] - 775) < 1, crunch
     assert abs(crunch["usable_inventory_m3"]) < 0.2, crunch
     assert abs(merdeka["allocated_quantity"] - 400) < 0.2, merdeka
-    assert abs(gamuda["allocated_quantity"] - 235) < 0.2, gamuda
-    assert gamuda["unserved_quantity"] > 64
-    assert jkr["unserved_quantity"] > 179, jkr
+    assert abs(gamuda["allocated_quantity"]) < 0.2, gamuda
+    assert gamuda["unserved_quantity"] > 299
+    assert abs(jkr["allocated_quantity"] - 180) < 0.2, jkr
     assert sunway["unserved_quantity"] > 219, sunway
-    assert elmina["unserved_quantity"] > 149, elmina
+    assert elmina["unserved_quantity"] > 90, elmina
     assert ytl["unserved_quantity"] > 159, ytl
     assert abs(mitra["unserved_quantity"]) < 0.2, mitra
+    assert hero["objective_epsilon_rm"] == 10
+    assert hero["recommendation_basis"] == "typed_milp"
+    assert hero["comparison"]["proportional_regret_under_true_terms_rm"] > 0
 
     policies = {row["policy_code"]: row["expected_consequence_rm"] for row in hero["policies"]}
     assert policies["optimised"] < policies["earliest"], policies
     assert policies["optimised"] < policies["internal"], policies
     assert policies["optimised"] < policies["external"], policies
-    assert "Gamuda" in hero["explanation"]["tradeoff"]
-    assert "JKR" in hero["explanation"]["tradeoff"]
-    assert "Mitrajaya" not in hero["explanation"]["tradeoff"]
-    assert "RM8" in hero["explanation"]["tradeoff"] or "RM8/" in hero["explanation"]["tradeoff"]
+    assert "earliest" in hero["explanation"]["tradeoff"].lower() or "Earliness" in hero["explanation"]["tradeoff"]
+    assert "RM10" in hero["explanation"]["tie_break"]
 
     g50 = _bucket(result, "Shah Alam Works", "G50")
-    assert abs(_line(g50, "INT-PENANG")["allocated_quantity"] - 190) < 0.2
-    assert abs(_line(g50, "INT-PENANG")["unserved_quantity"] - 20) < 0.2
-    assert _line(g50, "EXT-IJM")["unserved_quantity"] > 149
+    assert abs(_line(g50, "INT-PENANG")["allocated_quantity"] - 40) < 0.2
+    assert abs(_line(g50, "INT-PENANG")["unserved_quantity"] - 170) < 0.2
+    assert _line(g50, "EXT-IJM")["unserved_quantity"] < 0.2
 
     pcs = _bucket(result, "Pasir Gudang Works", "PCS")
     assert _line(pcs, "INT-ECRL")["unserved_quantity"] < 0.2
@@ -62,6 +63,10 @@ def main() -> None:
     assert result["totals"]["dated_shortfall_m3"] > result["totals"]["aggregate_gap_m3"]
     assert result["totals"]["horizon_surplus_m3"] > 0
     assert result["totals"]["value_protected_vs_earliest_rm"] > 0
+    assert result["totals"]["value_protected_vs_best_rule_rm"] >= 0
+    assert hero["solver_status"] == "Optimal"
+    assert hero["headline_gap"]["true_rm"] >= 0
+    assert _line(g50, "INT-PENANG")["partial_service_no_penalty_avoided"] is True
 
     print("Hero supply by 9 Oct", crunch["supply_to_date_m3"])
     print("Hero gap", crunch["gap_m3"])
@@ -69,6 +74,8 @@ def main() -> None:
     print("Dated shortfall", result["totals"]["dated_shortfall_m3"])
     print("Horizon surplus", result["totals"]["horizon_surplus_m3"])
     print("Value protected vs earliest", result["totals"]["value_protected_vs_earliest_rm"])
+    print("Value protected vs best rule", result["totals"]["value_protected_vs_best_rule_rm"])
+    print("Best rules", result["totals"]["best_rule_by_bucket"])
     print("SELF-CHECK PASSED")
 
 

@@ -14,7 +14,7 @@ from app.db import connect, get_meta, init_db, reset_data, set_meta
 from app.forecast import history_rows
 from app.economics import HORIZON_DAYS, HORIZON_START
 
-SEED_VERSION = "2026-10-hero-3"
+SEED_VERSION = "2026-10-hero-5"
 START = date.fromisoformat(HORIZON_START)
 
 
@@ -474,7 +474,23 @@ def _demand_rows() -> list[tuple]:
     ]
     rows = []
     for item in raw:
-        rows.append((*item, now))
+        code = item[0]
+        demand_type = item[1]
+        customer_type = item[3]
+        penalty = float(item[12])
+        if demand_type == "External" and customer_type in {"Government", "Main contractor"} and penalty > 0:
+            penalty_type = "lump_sum"
+        else:
+            penalty_type = "per_m3"
+        delay_type = {
+            "INT-MERDEKA": "lump_days",
+            "INT-PENANG": "lump_days",
+            "INT-RTS": "lump_days",
+            "INT-ECRL": "lump_days",
+            "INT-KWASA": "per_day",
+            "INT-SILO": "per_day",
+        }.get(code, "proportional")
+        rows.append((*item, now, penalty_type, delay_type, 0, "any", 1, 1, 0))
     return rows
 
 
@@ -520,8 +536,10 @@ def seed(force: bool = False) -> None:
                 demand_code, demand_type, customer_or_project, customer_type, plant_id, product_id,
                 required_date, requested_quantity, confirmed_quantity, demand_status, confidence_level,
                 contribution_margin, contractual_penalty, project_criticality, delay_days_if_unserved,
-                delay_cost_per_day, source, notes, created_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                delay_cost_per_day, source, notes, created_at,
+                penalty_type, delay_type, penalty_type_unverified, lump_sum_trigger,
+                types_unverified, delay_type_unverified, minimum_useful_delivery_m3
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             _demand_rows(),
         )
