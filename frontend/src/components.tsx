@@ -49,6 +49,10 @@ export function ErrorNote({ message }: { message: string }) {
   return <p className="error">{message}</p>;
 }
 
+export function EmptyNote({ message }: { message: string }) {
+  return <p className="note empty-state">{message}</p>;
+}
+
 export function Assumptions({ items }: { items: string[] }) {
   return (
     <details className="assumptions">

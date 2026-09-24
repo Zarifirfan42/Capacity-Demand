@@ -1,16 +1,25 @@
+function finite(value: number | null | undefined): number | null {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? amount : null;
+}
+
 export function rm(value: number | null | undefined): string {
-  const amount = Number(value ?? 0);
+  const amount = finite(value);
+  if (amount == null) return "—";
   const sign = amount < 0 ? "-" : "";
   return `${sign}RM${Math.abs(amount).toLocaleString("en-MY", { maximumFractionDigits: 0 })}`;
 }
 
 export function m3(value: number | null | undefined): string {
-  const amount = Number(value ?? 0);
+  const amount = finite(value);
+  if (amount == null) return "—";
   return `${amount.toLocaleString("en-MY", { maximumFractionDigits: 1 })} m³`;
 }
 
 export function num(value: number | null | undefined, digits = 1): string {
-  return Number(value ?? 0).toLocaleString("en-MY", { maximumFractionDigits: digits, minimumFractionDigits: digits });
+  const amount = finite(value);
+  if (amount == null) return "—";
+  return amount.toLocaleString("en-MY", { maximumFractionDigits: digits, minimumFractionDigits: digits });
 }
 
 export function shortDate(iso: string | null | undefined): string {

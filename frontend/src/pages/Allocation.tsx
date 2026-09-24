@@ -310,7 +310,7 @@ export function AllocationPage() {
 
   if (shadowForm) {
     return (
-      <div className="page">
+      <div className="page page-allocation">
         <PageHeader kicker="Shadow" title="Informal plan" lede="Record what you would actually run before the recommendation is shown. Both plans are then scored by the model on this same book." />
         {error ? <ErrorNote message={error} /> : null}
         <Panel title="Quantities you would run" sub="This plant is in shadow. The recommendation stays hidden until this plan is stored.">
@@ -347,12 +347,19 @@ export function AllocationPage() {
   const policies = bucket.policies.map((policy) => ({ name: policy.policy.replace("Minimise business consequence", "Recommended"), value: policy.expected_consequence_rm, code: policy.policy_code }));
 
   return (
-    <div className="page">
+    <div className="page page-allocation">
       <PageHeader
         kicker={bucket.solver}
         title="Allocation Decision"
         lede={bucket.objective}
       />
+      {params.get("decision") ? <p className="note">Opened from the queue for decision {params.get("decision")}.</p> : null}
+      {result.economics_incomplete && result.economics_incomplete.n > 0 ? (
+        <Panel title="Economics incomplete" sub={result.economics_incomplete.note}>
+          <p>Recommendation, including default-margin lines: {rm(result.economics_incomplete.with_expected_consequence_rm)}. Headline book without those lines: {rm(result.economics_incomplete.without_expected_consequence_rm)}.</p>
+        </Panel>
+      ) : null}
+      {bucket.allocations.length === 0 ? <p className="note">No orders are in this plant and product.</p> : null}
       <div className="stepper">
         {["Data", "Recommendation", "Human review", "Approve or modify", "Recorded"].map((step, index) => (
           <span key={step} className={index <= (recorded ? 4 : 3) ? "on" : ""}>{step}</span>
@@ -538,6 +545,7 @@ export function AllocationPage() {
                 <tr key={line.demand_id} className={line.unserved_quantity > 0 ? "constrained" : ""}>
                   <td>
                     <strong>{line.customer_or_project}</strong>
+                    {line.economics_badge ? <div className="note">{line.economics_badge}</div> : null}
                     <div className="note">{line.demand_code} · {line.demand_type} · {line.confidence_level} · {line.project_criticality}{line.owner_name ? ` · owner ${line.owner_name}` : ""}</div>
                   </td>
                   <td className="nowrap">{longDate(line.required_date)}</td>

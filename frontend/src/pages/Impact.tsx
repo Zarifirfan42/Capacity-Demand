@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api } from "../api";
-import { Assumptions, ErrorNote, Kpi, PageHeader, Panel } from "../components";
+import { Assumptions, EmptyNote, ErrorNote, Kpi, PageHeader, Panel } from "../components";
 import { m3, num, rm, when } from "../format";
 import type { DecisionRow } from "../types";
 
@@ -118,6 +118,14 @@ export function ImpactPage() {
   if (error) return <ErrorNote message={error} />;
   if (!data) return <p>Calculating business impact…</p>;
 
+  if (data.columns.length === 0) {
+    return (
+      <div className="page">
+        <PageHeader kicker="Same demand, same capacity" title="Business Impact" lede="No impact columns are loaded." />
+        <EmptyNote message="No impact columns are loaded." />
+      </div>
+    );
+  }
   const pilot = data.columns.find((column) => column.key === "pilot");
   const band = data.value_protected_range;
   const chart = [

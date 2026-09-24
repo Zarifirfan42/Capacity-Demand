@@ -11,6 +11,7 @@ const LINKS: readonly (readonly [string, string, string])[] = [
   ["/scenarios", "05", "Scenario Simulator"],
   ["/impact", "06", "Business Impact"],
   ["/measurement", "07", "Measurement"],
+  ["/queue", "08", "My queue"],
 ];
 
 const ROLE_LABELS: Record<string, string> = {
@@ -28,6 +29,7 @@ export function Layout() {
   const [roles, setRoles] = useState<string[]>(["viewer", "scheduler", "plant_supervisor", "project_planner", "commercial_owner", "admin"]);
   const [identity, setIdentity] = useState("");
   const [mockBadge, setMockBadge] = useState("");
+  const [sessionError, setSessionError] = useState("");
   useEffect(() => {
     api<{ hints: Record<string, string>; roles: string[]; identity_note: string }>("/api/auth-status")
       .then((row) => {
@@ -38,8 +40,11 @@ export function Layout() {
       .catch(() => undefined);
     api<{ badge: string | null }>("/api/intake/status")
       .then((row) => setMockBadge(row.badge || ""))
-      .catch(() => undefined);
-  }, []);
+      .catch((err: Error) => setSessionError(err.message));
+    api<{ role: string }>("/api/session")
+      .then(() => setSessionError(""))
+      .catch((err: Error) => setSessionError(err.message));
+  }, [role, passcode]);
   return (
     <div className="shell">
       <aside className="sidebar">
@@ -70,6 +75,7 @@ export function Layout() {
       </aside>
       <main className="main">
         {mockBadge ? <div className="mock-banner">{mockBadge}</div> : null}
+        {sessionError ? <p className="error">{sessionError}</p> : null}
         <Outlet />
       </main>
     </div>

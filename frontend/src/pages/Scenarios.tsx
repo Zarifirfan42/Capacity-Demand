@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api } from "../api";
-import { ErrorNote, PageHeader, Panel } from "../components";
+import { EmptyNote, ErrorNote, PageHeader, Panel } from "../components";
 import { m3, num, rm } from "../format";
 import type { Meta, MetaDemand } from "../types";
 
@@ -177,6 +177,7 @@ export function ScenarioPage() {
         lede="Capacity, quantity, required date, inventory, delay cost, margin, and criticality can be changed. Each column is a fresh linear programme, not a manual edit of the last answer."
       />
       {error ? <ErrorNote message={error} /> : null}
+      {meta && meta.plants.length === 0 ? <EmptyNote message="No plants are loaded, so a scenario has nothing to change." /> : null}
       <div className="scenario-grid">
         {drafts.map((draft, index) => (
           <section key={index} className="scenario-card">

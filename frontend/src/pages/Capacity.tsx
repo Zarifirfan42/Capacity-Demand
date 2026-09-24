@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Bar, CartesianGrid, ComposedChart, Legend, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api } from "../api";
-import { ErrorNote, PageHeader, Panel } from "../components";
+import { EmptyNote, ErrorNote, PageHeader, Panel } from "../components";
 import { longDate, m3, rm, shortDate } from "../format";
 import type { Meta } from "../types";
 
@@ -60,6 +60,8 @@ export function CapacityPage() {
         lede="Available capacity is what remains after production already committed outside this demand book. Ready-mix cannot be stocked. Precast usable inventory is on-hand stock above safety stock."
       />
       {error ? <ErrorNote message={error} /> : null}
+      {meta && meta.plants.length === 0 ? <EmptyNote message="No plants are loaded." /> : null}
+      {view && view.series.length === 0 ? <EmptyNote message="No capacity days are loaded for this plant and product." /> : null}
       <div className="filters">
         <div className="field">
           <label>Plant</label>

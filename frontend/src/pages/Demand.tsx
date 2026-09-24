@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import { ErrorNote, PageHeader, Panel } from "../components";
+import { EmptyNote, ErrorNote, PageHeader, Panel } from "../components";
 import { longDate, m3, rm } from "../format";
 import type { DemandRow, Meta } from "../types";
 
@@ -92,6 +92,10 @@ export function DemandPage() {
   const [receivedAt, setReceivedAt] = useState(localStamp);
   const [started, setStarted] = useState<number | null>(null);
   const [acceptCeiling, setAcceptCeiling] = useState(false);
+  const [acceptDefault, setAcceptDefault] = useState(false);
+  const [ackPenalty, setAckPenalty] = useState(false);
+  const [ackDelay, setAckDelay] = useState(false);
+  const [drafts, setDrafts] = useState<Draft[]>([]);
   const [ownerName, setOwnerName] = useState("");
   const [ownerRole, setOwnerRole] = useState("");
   const [manual, setManual] = useState(false);
@@ -147,6 +151,7 @@ export function DemandPage() {
       setSteps(result.steps);
       setWarnings(result.warnings);
       setDraft(result.draft);
+      setDrafts((result as { drafts?: Draft[] }).drafts?.length ? (result as { drafts?: Draft[] }).drafts || [] : result.draft ? [result.draft] : []);
       setIntake(result);
       setProposed({
         customer_or_project: result.draft?.customer_or_project ?? null,
@@ -219,6 +224,9 @@ export function DemandPage() {
           received_at: receivedAt ? new Date(receivedAt).toISOString() : null,
           contacts_kept_local: intake?.contacts_kept_local || [],
           accept_ceiling: acceptCeiling,
+          accept_default_margin: acceptDefault,
+          acknowledge_zero_penalty: ackPenalty,
+          acknowledge_zero_delay: ackDelay,
           owner_name: ownerName,
           owner_role: ownerRole,
         }),
@@ -319,6 +327,7 @@ export function DemandPage() {
         </Panel>
       ) : null}
       {error ? <ErrorNote message={error} /> : null}
+      {tab === "book" && rows.length === 0 && !error ? <EmptyNote message="No orders are in the book. Add a line from intake, or load the synthetic book." /> : null}
       {message ? <div className="banner good">{message}</div> : null}
       {tab === "book" ? <>
       <div className="kpi-grid">
@@ -412,7 +421,7 @@ export function DemandPage() {
                 <tr key={row.id} className={`click ${selected?.id === row.id ? "selected" : ""}`} onClick={() => setSelected(row)}>
                   <td className="nowrap">{row.demand_code}</td>
                   <td><span className={`badge ${row.demand_type === "Internal" ? "internal" : "external"}`}>{row.demand_type}</span></td>
-                  <td>{row.customer_or_project}</td>
+                  <td>{row.customer_or_project}{row.economics_basis === "default_assumption" ? <div className="note">Economics incomplete</div> : null}</td>
                   <td>{row.customer_type}</td>
                   <td className="nowrap">{row.plant_name}</td>
                   <td className="nowrap">{row.product_name}</td>
@@ -509,9 +518,19 @@ export function DemandPage() {
                 <div className="field"><label>Penalty RM, typed</label><input type="number" value={draft.contractual_penalty} onChange={(event) => setDraft({ ...draft, contractual_penalty: Number(event.target.value) })} /></div>
                 <div className="field"><label>Delay days, typed</label><input type="number" value={draft.delay_days_if_unserved} onChange={(event) => setDraft({ ...draft, delay_days_if_unserved: Number(event.target.value) })} /></div>
                 <div className="field"><label>Delay RM per day, typed</label><input type="number" value={draft.delay_cost_per_day} onChange={(event) => setDraft({ ...draft, delay_cost_per_day: Number(event.target.value) })} /></div>
+                {drafts.length > 1 ? (
+                  <div className="btn-row">
+                    {drafts.map((item, index) => (
+                      <button key={index} className="btn" type="button" onClick={() => setDraft(item)}>Order {index + 1}: {item.requested_quantity ?? "—"} m³ {item.customer_or_project}</button>
+                    ))}
+                  </div>
+                ) : null}
                 {warnings.some((warning) => warning.includes("2,000") || warning.includes("2000")) ? (
                   <label className="note"><input type="checkbox" checked={acceptCeiling} onChange={(event) => setAcceptCeiling(event.target.checked)} /> Accept a quantity above 2,000 m³</label>
                 ) : null}
+                <label className="note"><input type="checkbox" checked={acceptDefault} onChange={(event) => setAcceptDefault(event.target.checked)} /> Use the default margin for this product ({(meta?.default_margins || []).find((row) => row.product_id === draft.product_id)?.per_m3 ?? "—"} RM per m³, median of seeded lines). The line stays in the recommendation and is badged Economics incomplete.</label>
+                <label className="note"><input type="checkbox" checked={ackPenalty} onChange={(event) => setAckPenalty(event.target.checked)} /> There is no contractual penalty.</label>
+                <label className="note"><input type="checkbox" checked={ackDelay} onChange={(event) => setAckDelay(event.target.checked)} /> There is no delay cost.</label>
                 {intake?.intent === "cancel" ? null : <button className="btn primary" onClick={() => void saveDraft(manual ? "manual" : "save_new")}>{manual ? "Save manual line" : "Add to demand book"}</button>}
               </div>
             ) : <p className="note">Extract a document, or time a manual entry. The scheduler seat confirms it.</p>}
@@ -521,12 +540,12 @@ export function DemandPage() {
           <table>
             <thead><tr><th>Use</th><th>Where</th></tr></thead>
             <tbody>
-              <tr><td>Read a message into a demand line, then a person confirms it</td><td>Use now</td></tr>
+              <tr><td>Read a message into a demand line, then a person confirms it</td><td>Use now, with a person confirming. The model has not been compared with the rules.</td></tr>
               <tr><td>Forecasting with a learned model</td><td>Premature</td></tr>
               <tr><td>Letting a model choose the allocation</td><td>Never</td></tr>
               <tr><td>Anomaly flags on the book</td><td>Later</td></tr>
               <tr><td>Reading a contract clause for penalty type</td><td>Pilot, after a legal review. Not in this build.</td></tr>
-              <tr><td>Reading a photo of a paper order</td><td>Behind a flag. Three synthetic images are in the eval set. Vision was not run.</td></tr>
+              <tr><td>Reading a photo of a paper order</td><td>Behind a flag. Vision was not run. Scores on the 14-message file are a regression check, not accuracy evidence.</td></tr>
             </tbody>
           </table>
         </div>

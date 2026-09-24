@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import { ErrorNote, Kpi, PageHeader, Panel } from "../components";
+import { EmptyNote, ErrorNote, Kpi, PageHeader, Panel } from "../components";
 import { m3, rm } from "../format";
 import { usePlanner } from "../planner";
 
@@ -12,6 +12,7 @@ type Measurement = {
   live: {
     paired_shadow: { n: number; mean_gap_rm: number | null; inconclusive: boolean; definition: string };
     cash_paid_rm: number;
+    default_margin_lines_excluded?: number;
     programme_days_lost: number;
     override_share: { modified: number; decisions: number; quote_percentage: boolean };
     burden: { n: number; internal_unserved_share: number | null; external_unserved_share: number | null; internal_consequence_share: number | null };
@@ -119,6 +120,7 @@ export function MeasurementPage() {
         lede={data.primary}
       />
       <p className="note">{data.rollout}</p>
+      {live.default_margin_lines_excluded ? <EmptyNote message={`${live.default_margin_lines_excluded} line${live.default_margin_lines_excluded === 1 ? "" : "s"} on a default margin ${live.default_margin_lines_excluded === 1 ? "is" : "are"} left out of these figures.`} /> : null}
       <div className="kpi-grid">
         <Kpi label="Paired shadow decisions" value={String(live.paired_shadow.n)} hint={live.paired_shadow.inconclusive ? "Inconclusive below 8 pairs." : `Mean gap ${rm(live.paired_shadow.mean_gap_rm || 0)}`} />
         <Kpi label="Cash paid on LDs" value={rm(live.cash_paid_rm)} hint="Penalty actually paid. Not modelled penalty." />

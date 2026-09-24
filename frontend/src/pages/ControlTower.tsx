@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api } from "../api";
-import { Assumptions, ErrorNote, Kpi, PageHeader, Panel } from "../components";
+import { Assumptions, EmptyNote, ErrorNote, Kpi, PageHeader, Panel } from "../components";
 import { longDate, m3, num, rm, when } from "../format";
 import { usePlanner } from "../planner";
 import type { DecisionRow } from "../types";
@@ -94,6 +94,14 @@ export function ControlTowerPage() {
 
   if (error) return <ErrorNote message={error} />;
   if (!data) return <p>Loading the planning position…</p>;
+  if ((data.kpis.total_demand_m3 ?? 0) === 0 && (data.kpis.available_capacity_m3 ?? 0) === 0) {
+    return (
+      <div className="page">
+        <PageHeader kicker="No book" title="Control Tower" lede="No plants or orders are loaded." />
+        <EmptyNote message="No plants or orders are loaded. Charts stay blank until the synthetic book is seeded." />
+      </div>
+    );
+  }
   const k = data.kpis;
   const policies = [
     { name: "Recommended", value: data.policy_totals.optimised_rm },

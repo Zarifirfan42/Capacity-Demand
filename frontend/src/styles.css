@@ -168,3 +168,25 @@ textarea { width: 100%; min-height: 140px; resize: vertical; }
   .kpi-grid, .split, .rec-grid, .intake, .scenario-grid { grid-template-columns: 1fr; }
   .main { padding: 18px; }
 }
+
+@media (max-width: 420px) {
+  .shell, .main, .page-allocation, .page-queue { overflow-x: hidden; }
+  .main { padding: 12px; }
+  .page-allocation .table-wrap, .page-queue .table-wrap { overflow: visible; }
+  .page-allocation table, .page-queue table,
+  .page-allocation tbody, .page-queue tbody,
+  .page-allocation tr, .page-queue tr,
+  .page-allocation td, .page-queue td,
+  .page-allocation th, .page-queue th { display: block; width: 100%; }
+  .page-allocation thead, .page-queue thead { position: absolute; width: 1px; height: 1px; overflow: hidden; }
+  .page-allocation td, .page-queue td { border-bottom: 1px solid var(--line); text-align: left; }
+  .planner input, .planner select,
+  .page-allocation input, .page-queue input,
+  .page-allocation select, .page-queue select,
+  .page-allocation textarea, .page-queue textarea { font-size: 16px; min-height: 44px; }
+  .nav a { min-height: 44px; display: flex; align-items: center; }
+  .page-allocation .btn, .page-queue .btn,
+  .page-allocation button, .page-queue button,
+  .page-allocation a, .page-queue a { min-height: 44px; }
+  .page-queue a { display: inline-flex; align-items: center; }
+}

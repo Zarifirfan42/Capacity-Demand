@@ -30,6 +30,7 @@ export type Meta = {
   plants: Plant[];
   products: Product[];
   assumptions: string[];
+  default_margins?: { product_id: number; product_code: string; product_name: string; per_m3: number; n: number; rates_per_m3: number[] }[];
   samples: { ocr: string; email: string };
   demands: MetaDemand[];
   criticality_levels: string[];
@@ -58,6 +59,7 @@ export type DemandRow = {
   delay_cost_per_day: number;
   source: string;
   notes: string;
+  economics_basis?: string;
   penalty_type?: string;
   delay_type?: string;
   lump_sum_trigger?: string;
@@ -87,6 +89,7 @@ export type AllocationLine = {
   unit_expected_rm: number;
   unit_gross_rm: number;
   contribution_margin_rm: number;
+  economics_badge?: string;
   contractual_penalty_rm: number;
   delay_days_if_unserved: number;
   delay_cost_per_day_rm: number;
@@ -265,6 +268,13 @@ export type AllocationResult = {
   };
   buckets: Bucket[];
   assumptions: string[];
+  economics_incomplete?: {
+    n: number;
+    with_expected_consequence_rm: number;
+    without_expected_consequence_rm: number;
+    note: string;
+    lines: { demand_code: string; customer_or_project: string; quantity_m3: number; margin_rm: number }[];
+  };
   model?: {
     decision_variables: string[];
     objective: string;
