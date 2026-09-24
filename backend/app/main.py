@@ -912,7 +912,7 @@ def record_informal(body: InformalIn, _: str = Depends(require_writer)) -> dict:
         "paired_gap_rm": paired,
         "informal_expected_rm": informal_expected,
         "recommendation_expected_rm": recommendation_expected,
-        "definition": "Observed informal plan minus the modelled recommendation, scored on this same book.",
+        "definition": "Modelled consequence of the informal plan minus the modelled recommendation, on this same book. Not an observed outcome.",
     }
 
 

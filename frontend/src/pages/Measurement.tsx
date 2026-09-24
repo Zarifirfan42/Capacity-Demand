@@ -28,6 +28,7 @@ type Measurement = {
     watermark: string;
     missing?: boolean;
     note?: string;
+    informal_plan?: string;
     method?: string;
     success?: { paired_mean_gap_rm: number; failure_rule_fired: string | null; damages_per_constrained_day_baseline_rm: number | null; damages_per_constrained_day_pilot_rm: number | null };
     failure?: { paired_mean_gap_rm: number; failure_rule_fired: string | null; damages_per_constrained_day_baseline_rm: number | null; damages_per_constrained_day_pilot_rm: number | null };
@@ -134,6 +135,7 @@ export function MeasurementPage() {
       <Panel title={data.illustration.watermark || "Synthetic illustration"} sub="Not results. Kept off Control Tower.">
         {data.illustration.missing ? <p>{data.illustration.note}</p> : (
           <>
+            <p>{data.illustration.informal_plan}</p>
             <p>{data.illustration.method}</p>
             <p>Illustrated run: paired mean {rm(data.illustration.success?.paired_mean_gap_rm || 0)}. Failure rule: {data.illustration.success?.failure_rule_fired || "not fired"}.</p>
             <p>Second run, built to fail: {data.illustration.failure?.failure_rule_fired || "the failure rule did not fire"}.</p>

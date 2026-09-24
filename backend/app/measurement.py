@@ -11,6 +11,13 @@ from app.economics import round_m3, round_rm
 from app.engine import product_is_stockable
 
 WATERMARK = "SYNTHETIC ILLUSTRATION, not results"
+INFORMAL_PLAN_LABEL = (
+    "The synthetic informal plan is the best simple rule on that same noisy book: "
+    "internal-first, external-first, earliest required date, penalty and delay per m³, "
+    "complete-or-skip, or a greedy rank by unit expected consequence, whichever scores lowest. "
+    "The paired figure is the modelled consequence of that rule minus the recommendation. "
+    "It is not an observed outcome, and it is not the earliest-date gap."
+)
 
 
 def _illustration_path() -> Path:
@@ -185,7 +192,7 @@ def live_metrics() -> dict:
             "mean_gap_rm": None if not paired else round_rm(sum(paired) / len(paired)),
             "minimum_sample": 8,
             "inconclusive": len(paired) < 8,
-            "definition": "Informal-plan expected consequence minus the recommendation, on the same book.",
+            "definition": "Modelled consequence of the informal plan minus the modelled recommendation, on the same book. Not an observed outcome. Realised outcomes come from actuals.",
         },
         "cash_paid_rm": round_rm(cash_paid),
         "programme_days_lost": round(programme_days, 2),
@@ -244,50 +251,74 @@ def score_illustration(weeks: list[dict]) -> dict:
     }
 
 
+def weeks_from_solves(solved_months: list[dict]) -> list[dict]:
+    """Turn solved months into illustrated weeks. The gap is the best-simple-rule gap."""
+    rows = []
+    for index, solved in enumerate(solved_months):
+        recommended = float(solved["recommended_rm"])
+        gap = max(0.0, float(solved["best_rule_gap_rm"]))
+        window = "baseline" if index < 4 else "pilot"
+        rows.append(
+            {
+                "week": index + 1,
+                "window": window,
+                "paired_gap_rm": round_rm(gap),
+                "damages_rm": round_rm(recommended + (gap if window == "baseline" else 0.0)),
+                "constrained_days": int(solved.get("constrained_days") or 0),
+                "programme_days": float(solved.get("programme_days") or 0),
+            }
+        )
+    return rows
+
+
+def illustrate_failure(weeks: list[dict]) -> list[dict]:
+    """Copy a solved illustration and push the pilot the wrong way, so a failure rule can fire."""
+    rows = [dict(row) for row in weeks]
+    baseline = [row for row in rows if row["window"] == "baseline"]
+    pilot = [row for row in rows if row["window"] == "pilot"]
+    base_days = sum(int(row["constrained_days"]) for row in baseline) or 1
+    base_rate = sum(float(row["damages_rm"]) for row in baseline) / base_days
+    base_gap = sum(float(row["paired_gap_rm"]) for row in baseline)
+    pilot_gap = -((base_gap + 500.0 * max(len(pilot), 1)) / max(len(pilot), 1)) - 500.0
+    for row in pilot:
+        row["paired_gap_rm"] = round_rm(pilot_gap)
+        row["damages_rm"] = round_rm(base_rate * 1.4 * int(row["constrained_days"] or 1))
+    return rows
+
+
 def build_illustration() -> dict:
-    """One solved book, then the stress draw's noise, plus a second run that fails on purpose."""
+    """Twelve stress months. The informal plan is the best simple rule on each month."""
     import random
 
     from app.engine import allocate_world, load_world
     from app.stress import synthetic_month
 
     rng = random.Random(202610)
-    solved = allocate_world(load_world(), include_comparison=False, include_expedite=False, lex=False)
-    recommended = float(solved["totals"]["expected_consequence_rm"])
-    informal = recommended + float(solved["totals"]["value_protected_vs_earliest_rm"])
     base = load_world()
-
-    def weeks(fail: bool) -> list[dict]:
-        local = random.Random(202610 if not fail else 202611)
-        rows = []
-        for index in range(12):
-            drawn = synthetic_month(base, local)
-            scale = float(drawn["utilisation"]) / 1.6
-            noise = local.uniform(0.9, 1.1)
-            window = "baseline" if index < 4 else "pilot"
-            gap = (informal - recommended) * scale
-            damages = (recommended if window == "pilot" else informal) * 0.15 * scale * noise
-            if fail and window == "pilot":
-                gap = -abs(gap) - 500
-                damages *= 1.4
-            rows.append(
-                {
-                    "week": index + 1,
-                    "window": window,
-                    "paired_gap_rm": round_rm(gap),
-                    "damages_rm": round_rm(damages),
-                    "constrained_days": max(1, int(round(4 * scale))),
-                    "programme_days": round(1.2 * scale * noise, 2),
-                }
-            )
-        return rows
-
-    success_weeks = weeks(False)
-    failure_weeks = weeks(True)
+    solved_months = []
+    for _ in range(12):
+        world = synthetic_month(base, rng)
+        result = allocate_world(world, include_comparison=False, include_expedite=False, lex=False)
+        totals = result["totals"]
+        solved_months.append(
+            {
+                "recommended_rm": float(totals["expected_consequence_rm"]),
+                "best_rule_gap_rm": float(totals["value_protected_vs_best_rule_rm"]),
+                "constrained_days": 4 if float(totals["dated_shortfall_m3"]) > 0.5 else 1,
+                "programme_days": float(totals.get("programme_days") or 0),
+            }
+        )
+    success_weeks = weeks_from_solves(solved_months)
+    failure_weeks = illustrate_failure(success_weeks)
     payload = {
         "watermark": WATERMARK,
         "off_control_tower": True,
-        "method": "The October book is solved once. Each illustrated week rescales that result with the stress simulator's utilisation draw and a noise term. The second run forces the pilot the wrong way so a failure rule fires.",
+        "informal_plan": INFORMAL_PLAN_LABEL,
+        "method": (
+            "Each of 12 illustrated weeks is a stress-simulator month: utilisation, quantities, dates, and contract types are redrawn, then the book is solved. "
+            + INFORMAL_PLAN_LABEL
+            + " The second run keeps those solves and then sets the pilot gap below RM0 and the pilot damages per constrained day 40% above the baseline rate, so a failure rule fires."
+        ),
         "success": {**score_illustration(success_weeks), "weeks": success_weeks},
         "failure": {**score_illustration(failure_weeks), "weeks": failure_weeks},
     }
@@ -300,6 +331,7 @@ def build_illustration() -> dict:
 def main() -> None:
     payload = build_illustration()
     print(payload["watermark"])
+    print("success mean", payload["success"].get("paired_mean_gap_rm"))
     print("success failure", payload["success"].get("failure_rule_fired"))
     print("failure rule", payload["failure"].get("failure_rule_fired"))
 
@@ -324,5 +356,5 @@ def build_measurement() -> dict:
         "live": live_metrics(),
         "illustration": load_illustration(),
         "rollout": "Pre-registered stagger: Shah Alam Works in pilot, Pasir Gudang Works remaining in shadow as the control. Difference in differences uses the secondary per-constrained-day outcomes.",
-        "primary": "The paired shadow gap is the primary measure. Before/after realised outcomes are secondary and are shown per constrained day.",
+        "primary": "The primary measure is the modelled consequence of the informal plan minus the modelled recommendation, on the same book. Realised outcomes come later from actuals and are shown per constrained day.",
     }

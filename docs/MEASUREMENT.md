@@ -8,7 +8,7 @@ No metric counts logins, page views, or adoption.
 
 ## How we know it worked
 
-The primary measure is a paired comparison on the same book. For every shadow decision the planner records an informal plan before seeing the recommendation. Both plans are scored on that same demand, capacity, inventory, and contract terms. The difference is observed-informal expected consequence minus modelled-recommended expected consequence. A positive difference means the informal plan costs more than the recommendation on that book. Demand and capacity do not change between the two scores, so a before/after shift in the order book cannot explain the gap.
+The primary measure is a paired comparison on the same book. For every shadow decision the planner records an informal plan before seeing the recommendation. Both plans are scored on that same demand, capacity, inventory, and contract terms. The difference is the modelled consequence of the informal plan minus the modelled consequence of the recommendation. The quantities are what the planner recorded. The ringgit figure is a model score, not a realised outcome. A positive difference means the informal plan costs more than the recommendation on that book. Demand and capacity do not change between the two scores, so a before/after shift in the order book cannot explain the gap.
 
 Before/after realised outcomes are secondary. They are reported per constrained day (the outcome divided by the count of constrained days in the window), because a busier window has more days on which a shortage can occur.
 

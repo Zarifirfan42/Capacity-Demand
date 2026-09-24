@@ -105,7 +105,7 @@ export function AllocationPage() {
     )
       .then((payload) => {
         const row = payload.rows[0];
-        setPairedNote(row ? `Paired gap ${rm(row.paired_gap_rm)}: informal ${rm(row.informal_expected_rm)} minus recommendation ${rm(row.recommendation_expected_rm)} on this same book.` : "");
+        setPairedNote(row ? `Modelled consequence of the informal plan ${rm(row.informal_expected_rm)} minus the recommendation ${rm(row.recommendation_expected_rm)}. Paired gap ${rm(row.paired_gap_rm)}. Not an observed outcome.` : "");
       })
       .catch(() => setPairedNote(""));
   }, [bucket]);
@@ -287,7 +287,7 @@ export function AllocationPage() {
           allocations: shadowForm.rows.map((row) => ({ demand_id: row.id, allocated_quantity: Number(shadowQty[row.id] ?? 0) })),
         }),
       });
-      setSaved(`Informal plan stored. Paired gap ${rm(response.paired_gap_rm)}: informal ${rm(response.informal_expected_rm)} minus recommendation ${rm(response.recommendation_expected_rm)} on this same book.`);
+      setSaved(`Informal plan stored. Modelled consequence of that plan ${rm(response.informal_expected_rm)} minus the recommendation ${rm(response.recommendation_expected_rm)}. Paired gap ${rm(response.paired_gap_rm)}. Not an observed outcome.`);
       setReveal((value) => value + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not store the informal plan.");
@@ -297,7 +297,7 @@ export function AllocationPage() {
   if (shadowForm) {
     return (
       <div className="page">
-        <PageHeader kicker="Shadow" title="Informal plan" lede="Record what you would actually run before the recommendation is shown. Both plans are then scored on this same book." />
+        <PageHeader kicker="Shadow" title="Informal plan" lede="Record what you would actually run before the recommendation is shown. Both plans are then scored by the model on this same book." />
         {error ? <ErrorNote message={error} /> : null}
         <Panel title="Quantities you would run" sub="This plant is in shadow. The recommendation stays hidden until this plan is stored.">
           <div className="field"><label>Plant</label>
@@ -375,7 +375,7 @@ export function AllocationPage() {
           )}
         </div>
       ) : null}
-      {bucket.plant_mode === "shadow" ? <p className="note">This plant is in shadow. The informal plan is the executed plan. The paired gap is informal expected consequence minus the recommendation on this same book.</p> : <p className="note">This plant is in pilot. An approval writes committed production onto the calendar.</p>}
+      {bucket.plant_mode === "shadow" ? <p className="note">This plant is in shadow. The informal plan is the executed plan. The paired gap is the modelled consequence of that plan minus the modelled recommendation. It is not an observed outcome.</p> : <p className="note">This plant is in pilot. An approval writes committed production onto the calendar.</p>}
       {pairedNote ? <div className="banner good">{pairedNote}</div> : null}
       <div className="field"><label>Buffer days for lump-sum orders</label>
         <input type="number" min={0} max={14} value={bufferDays} onChange={(event) => void saveBuffer(Number(event.target.value))} />
