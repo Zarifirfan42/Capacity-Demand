@@ -578,19 +578,28 @@ def _solve_lp(
         if pulp.LpStatus[status_name] != "Optimal":
             raise RuntimeError(f"Allocation solver returned {pulp.LpStatus[status_name]}.")
 
-    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_SECONDS)
-    status = problem.solve(solver)
+    def _solver() -> pulp.PULP_CBC_CMD:
+        # A fresh solver each pass. Reusing one, or letting presolve drop a fixed
+        # lump-sum binary, makes the next pass look infeasible on the Linux CBC build.
+        return pulp.PULP_CBC_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_SECONDS, presolve=False)
+
+    status = problem.solve(_solver())
     _finish(status)
     best = float(pulp.value(business) or 0.0)
     if lex and epsilon >= 0 and partials and not extra:
-        problem += business <= best + float(epsilon), "epsilon_band"
-        problem.setObjective(pulp.lpSum(partials))
-        status = problem.solve(solver)
+        # Slack covers a cost CBC fixed during presolve and then omitted from the solution.
+        # The weight keeps the RM10 band unless the reported cost was short of a real plan.
+        band_slack = pulp.LpVariable("band_slack", lowBound=0)
+        problem += business <= best + float(epsilon) + band_slack, "epsilon_band"
+        problem.setObjective(pulp.lpSum(partials) + 1e6 * band_slack)
+        status = problem.solve(_solver())
         _finish(status)
+        problem += band_slack <= float(pulp.value(band_slack) or 0.0) + 1e-4, "band_slack_fix"
         best_partials = float(pulp.value(pulp.lpSum(partials)) or 0.0)
-        problem += pulp.lpSum(partials) <= best_partials + 0.01, "partial_band"
-        problem.setObjective(pulp.lpSum(date_weight))
-        status = problem.solve(solver)
+        partial_slack = pulp.LpVariable("partial_slack", lowBound=0)
+        problem += pulp.lpSum(partials) <= best_partials + 0.01 + partial_slack, "partial_band"
+        problem.setObjective(pulp.lpSum(date_weight) + 1e6 * partial_slack + 1e6 * band_slack)
+        status = problem.solve(_solver())
         _finish(status)
 
     plan: dict[int, dict] = {}
