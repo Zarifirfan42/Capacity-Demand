@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
+from pathlib import Path
+
+os.environ["CDI_DB"] = str(Path(tempfile.mkdtemp()) / "selfcheck.db")
+
 from app.engine import allocate
+from app.operations import plant_mode
 from app.seed import seed
 
 
@@ -76,6 +83,7 @@ def main() -> None:
     print("Value protected vs earliest", result["totals"]["value_protected_vs_earliest_rm"])
     print("Value protected vs best rule", result["totals"]["value_protected_vs_best_rule_rm"])
     print("Best rules", result["totals"]["best_rule_by_bucket"])
+    print("Plant modes", {plant["name"]: plant_mode(plant["id"]) for plant in result["plants"]} if "plants" in result else "shadow by default")
     print("SELF-CHECK PASSED")
 
 
