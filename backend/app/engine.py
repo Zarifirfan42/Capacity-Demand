@@ -21,6 +21,7 @@ from app.economics import (
     consequence_for_unserved,
     expedite_advice,
     line_economics,
+    review_case,
     round_m3,
     round_rm,
 )
@@ -259,6 +260,12 @@ def _greedy(demands: list[dict], days: list[str], cap: dict[str, float], usable:
             return (0 if demand["demand_type"] == "Internal" else 1, -demand["unit_expected_rm"], demand["required_date"], demand["id"])
         if policy == "external":
             return (0 if demand["demand_type"] == "External" else 1, -demand["unit_expected_rm"], demand["required_date"], demand["id"])
+        if policy == "practice":
+            # Illustrative informal rule. Firm orders first, then the due date, then commercial
+            # margin and penalty. Programme delay is intentionally left out of this sort.
+            certainty = {"Confirmed": 0, "Probable": 1, "Forecast": 2}.get(demand["confidence_level"], 1)
+            commercial = float(demand["margin_per_m3"]) + float(demand["penalty_per_m3"])
+            return (certainty, demand["required_date"], -commercial, demand["id"])
         return (demand["required_date"], -demand["unit_expected_rm"], demand["id"])
 
     plan: dict[int, dict] = {}
@@ -460,6 +467,13 @@ def _reasons(lines: list[dict], windows: list[dict]) -> None:
                 f"Partially served. Dated supply runs out at {_rm(line['unit_expected_rm'])}/m³, "
                 f"after {marginal['customer_or_project']} at {_rm(marginal['unit_expected_rm'])}/m³."
             )
+        dated = next((row for row in windows if row["date"] == line["required_date"]), None)
+        if dated:
+            line["why_not"] = (
+                f"By {_pretty(line['required_date'])}, orders due on or before that date need "
+                f"{_m3(dated['demand_to_date_m3'])} and dated supply is {_m3(dated['supply_to_date_m3'])}. "
+                f"{line['reason']}"
+            )
 
 
 def _narrative(plant: str, product: str, supply: dict, lines: list[dict], policies: list[dict], expedites: list[dict], maintenance: list[str], windows: list[dict]) -> dict:
@@ -467,6 +481,7 @@ def _narrative(plant: str, product: str, supply: dict, lines: list[dict], polici
     earliest = next(row for row in policies if row["policy_code"] == "earliest")
     internal = next(row for row in policies if row["policy_code"] == "internal")
     external = next(row for row in policies if row["policy_code"] == "external")
+    practice = next(row for row in policies if row["policy_code"] == "practice")
     crunch = max(windows, key=lambda row: row["gap_m3"]) if windows else None
     paragraphs = [
         (
@@ -538,7 +553,8 @@ def _narrative(plant: str, product: str, supply: dict, lines: list[dict], polici
                 f"Earliness is a production constraint, not a priority rule."
             )
     policy_text = (
-        f"On the same capacity, an earliest-required-date rule leaves expected consequence of {_rm(earliest['expected_consequence_rm'])}. "
+        f"On the same capacity, the current-practice proxy (illustrative, not observed history) leaves expected consequence of {_rm(practice['expected_consequence_rm'])}. "
+        f"An earliest-required-date rule leaves {_rm(earliest['expected_consequence_rm'])}. "
         f"Internal-first leaves {_rm(internal['expected_consequence_rm'])}. "
         f"External-first leaves {_rm(external['expected_consequence_rm'])}. "
         f"The recommendation leaves {_rm(optimised['expected_consequence_rm'])}. "
@@ -620,6 +636,15 @@ def solve_bucket(world: dict, plant_id: int, product_id: int) -> dict:
         _policy_block("internal", "Internal projects first", "Priority rule on the same capacity", demands, _greedy(demands, days, cap, usable, "internal"), emergency, assumption),
         _policy_block("external", "External customers first", "Priority rule on the same capacity", demands, _greedy(demands, days, cap, usable, "external"), emergency, assumption),
         _policy_block("earliest", "Earliest required date", "Priority rule on the same capacity", demands, _greedy(demands, days, cap, usable, "earliest"), emergency, assumption),
+        _policy_block(
+            "practice",
+            "Current practice proxy",
+            "Illustrative rule on the same capacity. Not observed history. Firm orders, then due date, then margin and penalty. Programme delay is ignored.",
+            demands,
+            _greedy(demands, days, cap, usable, "practice"),
+            emergency,
+            assumption,
+        ),
     ]
     ranked = sorted(demands, key=lambda row: (-row["unit_expected_rm"], row["required_date"], row["id"]))
     rank = {int(row["id"]): index for index, row in enumerate(ranked, start=1)}
@@ -701,6 +726,24 @@ def solve_bucket(world: dict, plant_id: int, product_id: int) -> dict:
         "explanation": _narrative(plant["name"], product["name"], supply, lines, policies, expedites, maintenance, windows),
         "objective": "Minimise expected contribution margin at risk + contractual penalty + programme delay cost, subject to dated plant capacity, usable inventory, product compatibility, and required dates.",
         "solver": "CBC linear programme",
+        "decision_review": review_case(
+            totals["programme_days"],
+            totals["expected_consequence_rm"],
+            totals["penalty_at_risk_rm"],
+            any(line["demand_type"] == "Internal" and line["programme_days"] > 0.05 for line in lines),
+            any(line["demand_type"] == "External" and line["penalty_at_risk_rm"] > 1 for line in lines),
+        ),
+        "inventory_projection": {
+            "opening_on_hand_m3": round_m3(inventory["on_hand"]),
+            "safety_stock_m3": round_m3(inventory["safety_stock"]),
+            "drawn_from_inventory_m3": inventory_used,
+            "produced_for_allocation_m3": round_m3(sum(slot["from_production"] for slot in optimised_plan.values())),
+            "projected_closing_on_hand_m3": round_m3(max(0.0, float(inventory["on_hand"]) - inventory_used)),
+            "basis": (
+                "Projected, not observed. This model makes product only for the allocation, so production does not "
+                "increase stock. Closing on-hand is opening on-hand minus inventory drawn. There is no delivery ledger."
+            ),
+        },
     }
 
 
@@ -716,6 +759,7 @@ def allocate(scenario: dict | None = None) -> dict:
     earliest_expected = sum(next(p["expected_consequence_rm"] for p in bucket["policies"] if p["policy_code"] == "earliest") for bucket in buckets)
     internal_expected = sum(next(p["expected_consequence_rm"] for p in bucket["policies"] if p["policy_code"] == "internal") for bucket in buckets)
     external_expected = sum(next(p["expected_consequence_rm"] for p in bucket["policies"] if p["policy_code"] == "external") for bucket in buckets)
+    practice_expected = sum(next(p["expected_consequence_rm"] for p in bucket["policies"] if p["policy_code"] == "practice") for bucket in buckets)
     totals = {
         "total_demand_m3": add("total_demand_m3"),
         "internal_demand_m3": add("internal_demand_m3"),
@@ -733,12 +777,14 @@ def allocate(scenario: dict | None = None) -> dict:
         "gross_consequence_rm": add("gross_consequence_rm"),
         "expected_consequence_rm": round_rm(optimised_expected),
         "programme_days": round(sum(bucket["programme_days"] for bucket in buckets), 2),
+        "value_protected_vs_practice_rm": round_rm(practice_expected - optimised_expected),
         "value_protected_vs_earliest_rm": round_rm(earliest_expected - optimised_expected),
         "value_protected_vs_internal_first_rm": round_rm(internal_expected - optimised_expected),
         "value_protected_vs_external_first_rm": round_rm(external_expected - optimised_expected),
         "earliest_expected_consequence_rm": round_rm(earliest_expected),
         "internal_first_expected_consequence_rm": round_rm(internal_expected),
         "external_first_expected_consequence_rm": round_rm(external_expected),
+        "practice_expected_consequence_rm": round_rm(practice_expected),
         "constrained_buckets": sum(1 for bucket in buckets if bucket["constrained"]),
     }
     return {
@@ -748,6 +794,27 @@ def allocate(scenario: dict | None = None) -> dict:
         "solver": "CBC linear programme",
         "objective": buckets[0]["objective"] if buckets else "",
         "assumptions": ASSUMPTIONS,
+        "model": {
+            "decision_variables": [
+                "For each order: cubic metres taken from usable inventory.",
+                "For each order and each day on or before its required date: cubic metres produced that day.",
+                "For each order: cubic metres left unserved.",
+            ],
+            "objective": "Minimise the sum of (expected RM per unserved m³ × unserved m³), plus a 0.0001 weight on production so inventory is used before the line when the ringgit result is the same.",
+            "constraints": [
+                "Production on allowed days + inventory used + unserved = requested quantity.",
+                "Production on a day cannot exceed that day's available capacity.",
+                "Inventory used cannot exceed on-hand minus safety stock.",
+                "No production variable exists after the required date, or on another plant or product.",
+            ],
+            "solver": "CBC linear programme, one solve per plant and product.",
+            "not_in_the_objective": [
+                "Emergency RM per m³ is an expedite screen, not extra base capacity.",
+                "Criticality is a label. It changes the solve only when a scenario rescales delay cost.",
+                "Internal versus external is not a weight. Those labels are comparison rules only.",
+            ],
+            "forecast_limit": "The October order book and the 12-month synthetic history are separate. The forecast is a planning signal. It is not a confirmed order and it is not a solver input. Confirmed, Probable, and Forecast on an order are planning-certainty weights, not calibrated probabilities.",
+        },
         "totals": totals,
         "buckets": buckets,
     }
@@ -924,7 +991,9 @@ def control_tower() -> dict:
             "penalty_at_risk_rm": totals["penalty_at_risk_rm"],
             "expected_consequence_rm": totals["expected_consequence_rm"],
             "gross_consequence_rm": totals["gross_consequence_rm"],
-            "value_protected_rm": totals["value_protected_vs_earliest_rm"],
+            "value_protected_rm": totals["value_protected_vs_practice_rm"],
+            "value_protected_vs_earliest_rm": totals["value_protected_vs_earliest_rm"],
+            "value_protected_note": "Versus the current-practice proxy. The earliest-date comparison is separate and is not a claim about current practice.",
             "constrained_buckets": totals["constrained_buckets"],
         },
         "insight": (
@@ -933,11 +1002,29 @@ def control_tower() -> dict:
             "The decision is which orders absorb that dated shortfall."
         ),
         "hotspots": hotspots,
+        "exceptions": [
+            {
+                "tone": "critical" if row["shortfall_m3"] >= 200 or row["programme_days"] >= 2 else "watch",
+                "plant_id": row["plant_id"],
+                "product_id": row["product_id"],
+                "plant_name": row["plant_name"],
+                "product_name": row["product_name"],
+                "crunch_date": row["crunch_date"],
+                "shortfall_m3": row["shortfall_m3"],
+                "programme_days": row["programme_days"],
+                "text": (
+                    f"{row['plant_name']} / {row['product_name']}: dated shortfall {_m3(row['shortfall_m3'])} "
+                    f"by {_pretty(row['crunch_date'])}. Programme days left open in the recommendation: {row['programme_days']:g}."
+                ),
+            }
+            for row in hotspots
+        ],
         "policy_totals": {
             "optimised_rm": totals["expected_consequence_rm"],
             "earliest_rm": totals["earliest_expected_consequence_rm"],
             "internal_first_rm": totals["internal_first_expected_consequence_rm"],
             "external_first_rm": totals["external_first_expected_consequence_rm"],
+            "practice_rm": totals["practice_expected_consequence_rm"],
         },
         "assumptions": ASSUMPTIONS,
     }

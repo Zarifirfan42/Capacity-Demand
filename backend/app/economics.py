@@ -11,11 +11,19 @@ HORIZON_START = "2026-10-01"
 HORIZON_END = "2026-10-30"
 HORIZON_DAYS = 30
 
+# Judgemental planning-certainty weights. They are not calibrated probabilities.
 CONFIDENCE_FACTOR = {
     "Confirmed": 1.0,
     "Probable": 0.75,
     "Forecast": 0.45,
 }
+PLANNING_CERTAINTY_WEIGHT = CONFIDENCE_FACTOR
+
+# Assumptions for who reviews a recommendation. Not a company policy.
+REVIEW_PROGRAMME_DAYS = 2.0
+REVIEW_EXPECTED_CONSEQUENCE_RM = 25000.0
+REVIEW_PENALTY_RM = 20000.0
+CARRYING_RATE_ANNUAL = 0.08
 
 CRITICALITY_MULT = {
     "Critical": 1.5,
@@ -32,7 +40,10 @@ ASSUMPTIONS = [
     "Available supply = available capacity + usable inventory.",
     "An order can only use its own plant and its own product, on or before its required date. Products are not substitutes, and plants are not balanced automatically.",
     "Partial supply is allowed. Margin, contractual penalty, and programme delay cost scale with the unserved fraction of the order.",
-    "Confidence weights the objective only: Confirmed 100%, Probable 75%, Forecast 45%. Gross ringgit amounts are still shown in full.",
+    "Planning certainty weights scale the objective only: Confirmed 100%, Probable 75%, Forecast 45%. These are judgemental weights, not calibrated probabilities. Gross ringgit amounts are still shown in full.",
+    "The current-practice proxy is an illustrative rule: firm orders first, then required date, then margin and penalty per m³. It ignores programme delay. It is not an observed history.",
+    "Inventory carrying cost for the horizon = on-hand value × 8% a year × 30/365. The 8% rate is an assumption. On-hand value itself is not the carrying cost.",
+    "A material review is assumed when programme days are at least 2, expected consequence is at least RM25,000, or contractual penalty at risk is at least RM20,000. Those cut-offs are modelling assumptions.",
     "Project criticality is recorded for the planner. The optimiser uses the delay cost already stored on the order. Changing criticality in a scenario rescales that delay cost.",
     "Emergency production cost is an assumption used only on the expedite screen and in business impact. It is not added to base capacity unless a scenario raises capacity.",
     "The model recommends. A person approves or overrides, and that decision is stored.",
@@ -137,4 +148,44 @@ def expedite_advice(demand: dict, unserved: float, emergency_cost_per_m3: float,
         "consequence_if_accepted_rm": round_rm(accepted),
         "worth_expediting": worth,
         "net_benefit_rm": round_rm(accepted - expedite_cost),
+    }
+
+
+def carrying_cost(inventory_value_rm: float, days: int = HORIZON_DAYS) -> float:
+    """Cost of holding stock for this horizon. The value itself is not the cost."""
+    return round_rm(float(inventory_value_rm) * CARRYING_RATE_ANNUAL * (days / 365.0))
+
+
+def review_case(programme_days: float, expected_rm: float, penalty_rm: float, internal_delay: bool, external_penalty: bool) -> dict:
+    """Who reviews. Thresholds are labelled assumptions, not a head-office policy."""
+    triggers = []
+    if programme_days >= REVIEW_PROGRAMME_DAYS:
+        triggers.append(f"Programme days at risk are {programme_days:g}, at or above the assumed review line of {REVIEW_PROGRAMME_DAYS:g}.")
+    if expected_rm >= REVIEW_EXPECTED_CONSEQUENCE_RM:
+        triggers.append(f"Expected consequence is RM{expected_rm:,.0f}, at or above the assumed review line of RM{REVIEW_EXPECTED_CONSEQUENCE_RM:,.0f}.")
+    if penalty_rm >= REVIEW_PENALTY_RM:
+        triggers.append(f"Contractual penalty at risk is RM{penalty_rm:,.0f}, at or above the assumed review line of RM{REVIEW_PENALTY_RM:,.0f}.")
+    cross = internal_delay and external_penalty
+    if cross:
+        triggers.append("The same plant and product carries both an internal programme delay and an external penalty.")
+    if not triggers:
+        return {
+            "level": "normal",
+            "owner": "Plant scheduler",
+            "triggers": [],
+            "evidence": "The recommendation is inside the assumed review lines.",
+            "assumption": True,
+        }
+    if cross:
+        owner = "Plant supervisor, with the project planner and the commercial owner of the external order"
+        level = "cross-business"
+    else:
+        owner = "Plant supervisor, with the party that bears the larger consequence"
+        level = "material exception"
+    return {
+        "level": level,
+        "owner": owner,
+        "triggers": triggers,
+        "evidence": "The scheduler still prepares the recommendation. The named reviewers approve or override it, with a reason.",
+        "assumption": True,
     }

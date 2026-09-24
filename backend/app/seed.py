@@ -10,9 +10,10 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 
 from app.db import connect, get_meta, init_db, reset_data, set_meta
+from app.forecast import history_rows
 from app.economics import HORIZON_DAYS, HORIZON_START
 
-SEED_VERSION = "2026-10-hero-1"
+SEED_VERSION = "2026-10-hero-2"
 START = date.fromisoformat(HORIZON_START)
 
 
@@ -521,6 +522,13 @@ def seed(force: bool = False) -> None:
             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             _demand_rows(),
+        )
+        conn.executemany(
+            """
+            INSERT INTO demand_history(plant_id, product_id, demand_type, month_start, quantity_m3)
+            VALUES(?, ?, ?, ?, ?)
+            """,
+            history_rows(),
         )
         set_meta(conn, "seed_version", SEED_VERSION)
         set_meta(conn, "horizon_start", HORIZON_START)

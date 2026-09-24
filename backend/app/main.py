@@ -25,8 +25,20 @@ from app.engine import (
     solve_bucket,
 )
 from app.extractor import SAMPLE_EMAIL, SAMPLE_OCR, extract_demand
+from app.forecast import build_forecast
 from app.impact import build_impact
+from app.quality import assess
 from app.seed import seed
+
+REASON_CATEGORIES = (
+    "Customer commitment",
+    "Project criticality",
+    "Contractual obligation",
+    "Operational constraint",
+    "Management decision",
+    "Data issue",
+    "Other",
+)
 
 app = FastAPI(title="Capacity & Demand Intelligence", version="1.0.0")
 app.add_middleware(
@@ -129,6 +141,13 @@ class OverrideIn(BaseModel):
 class DecisionIn(OverrideIn):
     username: str = Field(min_length=2, max_length=80)
     override_reason: str = Field(min_length=3, max_length=1000)
+    reason_category: str = ""
+
+
+class ActualIn(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+    allocations: list[AllocationLineIn]
+    note: str = ""
 
 
 def _scenario_dict(scenario: ScenarioIn | None) -> dict | None:
@@ -428,6 +447,14 @@ def record_decision(body: DecisionIn) -> dict:
     if changed and len(reason) < 8:
         raise HTTPException(status_code=400, detail="A modified allocation needs a reason of at least a short sentence.")
     status = "modified" if changed else "approved"
+    category = body.reason_category.strip()
+    if changed:
+        if not category:
+            category = "Other"
+        if category not in REASON_CATEGORIES:
+            raise HTTPException(status_code=400, detail=f"Override category must be one of: {', '.join(REASON_CATEGORIES)}.")
+    else:
+        category = category or "Accepted recommendation"
     recommended_payload = {
         "scenario_name": world.get("scenario_name"),
         "allocations": bucket["allocations"],
@@ -457,8 +484,9 @@ def record_decision(body: DecisionIn) -> dict:
             INSERT INTO decisions(
                 created_at, username, plant_id, product_id, plant_name, product_name,
                 recommended_json, final_json, override_reason, status,
-                consequence_recommended, consequence_final, unserved_recommended, unserved_final
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                consequence_recommended, consequence_final, unserved_recommended, unserved_final,
+                reason_category
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now,
@@ -475,23 +503,142 @@ def record_decision(body: DecisionIn) -> dict:
                 scored["expected_consequence_rm"],
                 bucket["unserved_m3"],
                 scored["unserved_m3"],
+                category,
             ),
         )
         decision_id = cursor.lastrowid
         saved = fetch_one(conn, "SELECT * FROM decisions WHERE id = ?", (decision_id,))
-    saved["recommended"] = json.loads(saved.pop("recommended_json"))
-    saved["final"] = json.loads(saved.pop("final_json"))
-    return {"decision": saved, "status": status}
+    return {"decision": _hydrate_decision(saved), "status": status, "reason_categories": list(REASON_CATEGORIES)}
+
+
+def _hydrate_decision(row: dict) -> dict:
+    row["recommended"] = json.loads(row.pop("recommended_json"))
+    row["final"] = json.loads(row.pop("final_json"))
+    raw_actual = row.get("actual_json")
+    row["actual"] = json.loads(raw_actual) if raw_actual else None
+    row.pop("actual_json", None)
+    return row
 
 
 @app.get("/api/decisions")
-def list_decisions() -> dict:
+def list_decisions(
+    plant_id: int | None = None,
+    product_id: int | None = None,
+    status: str | None = None,
+    reason_category: str | None = None,
+) -> dict:
+    clauses = ["1=1"]
+    params: list = []
+    if plant_id:
+        clauses.append("plant_id = ?")
+        params.append(plant_id)
+    if product_id:
+        clauses.append("product_id = ?")
+        params.append(product_id)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    if reason_category:
+        clauses.append("reason_category = ?")
+        params.append(reason_category)
     with connect() as conn:
-        rows = fetch_all(conn, "SELECT * FROM decisions ORDER BY id DESC")
-    for row in rows:
-        row["recommended"] = json.loads(row.pop("recommended_json"))
-        row["final"] = json.loads(row.pop("final_json"))
-    return {"rows": rows}
+        rows = fetch_all(conn, f"SELECT * FROM decisions WHERE {' AND '.join(clauses)} ORDER BY id DESC", tuple(params))
+    return {"rows": [_hydrate_decision(row) for row in rows], "reason_categories": list(REASON_CATEGORIES)}
+
+
+@app.post("/api/decisions/{decision_id}/actual")
+def record_actual(decision_id: int, body: ActualIn) -> dict:
+    """Record what was actually supplied. This does not change the recommendation."""
+    with connect() as conn:
+        row = fetch_one(conn, "SELECT * FROM decisions WHERE id = ?", (decision_id,))
+        if row is None:
+            raise HTTPException(status_code=404, detail="Decision not found.")
+        recommended = json.loads(row["recommended_json"])
+        final = json.loads(row["final_json"])
+        recommended_qty = {line["demand_id"]: float(line["allocated_quantity"]) for line in recommended.get("allocations", [])}
+        approved_qty = {line["demand_id"]: float(line["allocated_quantity"]) for line in final.get("allocations", [])}
+        requested = {line["demand_id"]: float(line["requested_quantity"]) for line in final.get("allocations", [])}
+        incoming = {line.demand_id: line.allocated_quantity for line in body.allocations}
+        if set(incoming) != set(approved_qty):
+            raise HTTPException(status_code=400, detail="Actual quantities must cover the same demand lines as the approved allocation.")
+        lines = []
+        for demand_id, actual_qty in incoming.items():
+            if actual_qty < -0.01 or actual_qty > requested[demand_id] + 0.05:
+                raise HTTPException(status_code=400, detail="An actual quantity cannot be negative or above the requested quantity.")
+            lines.append(
+                {
+                    "demand_id": demand_id,
+                    "recommended_m3": round(recommended_qty.get(demand_id, 0.0), 2),
+                    "approved_m3": round(approved_qty[demand_id], 2),
+                    "actual_m3": round(actual_qty, 2),
+                    "decision_variance_m3": round(approved_qty[demand_id] - recommended_qty.get(demand_id, 0.0), 2),
+                    "execution_variance_m3": round(actual_qty - approved_qty[demand_id], 2),
+                }
+            )
+        payload = {
+            "note": body.note.strip(),
+            "lines": lines,
+            "basis": "Recorded outcome on the synthetic book. It is not an observed Chin Hin delivery.",
+        }
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        conn.execute(
+            """
+            UPDATE decisions
+            SET actual_json = ?, actual_note = ?, actual_recorded_at = ?, actual_username = ?
+            WHERE id = ?
+            """,
+            (json.dumps(payload), body.note.strip(), now, body.username.strip(), decision_id),
+        )
+        saved = fetch_one(conn, "SELECT * FROM decisions WHERE id = ?", (decision_id,))
+    return {"decision": _hydrate_decision(saved)}
+
+
+@app.get("/api/quality")
+def quality() -> dict:
+    return assess()
+
+
+@app.get("/api/planning-view")
+def planning_view() -> dict:
+    world = load_world()
+    buckets = {"Confirmed": 0.0, "Probable": 0.0, "Forecast": 0.0}
+    for row in world["demands"]:
+        level = row["confidence_level"]
+        buckets[level] = buckets.get(level, 0.0) + float(row["requested_quantity"])
+    return {
+        "by_confidence_m3": {key: round(value, 2) for key, value in buckets.items()},
+        "planning_view_m3": round(sum(buckets.values()), 2),
+        "certainty_note": "Confirmed, Probable, and Forecast are planning-certainty classes. The 100%, 75%, and 45% figures are judgemental weights, not calibrated probabilities.",
+        "forecast_method": "See /api/forecast for the synthetic history and the October planning forecast. That forecast is not copied into this order book.",
+    }
+
+
+class AdjustmentIn(BaseModel):
+    plant_id: int
+    product_id: int
+    adjustment_m3: float
+    note: str = ""
+
+
+@app.get("/api/forecast")
+def forecast() -> dict:
+    return build_forecast()
+
+
+@app.post("/api/forecast/adjustment")
+def forecast_adjustment(body: AdjustmentIn) -> dict:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO forecast_adjustments(plant_id, product_id, month_start, adjustment_m3, note)
+            VALUES(?, ?, '2026-10-01', ?, ?)
+            ON CONFLICT(plant_id, product_id, month_start) DO UPDATE SET
+                adjustment_m3 = excluded.adjustment_m3,
+                note = excluded.note
+            """,
+            (body.plant_id, body.product_id, body.adjustment_m3, body.note.strip()),
+        )
+    return build_forecast()
 
 
 @app.post("/api/scenarios/compare")

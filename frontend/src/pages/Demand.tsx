@@ -48,6 +48,18 @@ export function DemandPage() {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [quality, setQuality] = useState<{ quality_percent: number; quality_meaning: string; failed: number; issues: { code: string; message: string }[]; synthetic_note: string } | null>(null);
+  const [planning, setPlanning] = useState<{ by_confidence_m3: Record<string, number>; forecast_method: string; certainty_note?: string } | null>(null);
+  const [forecast, setForecast] = useState<{
+    label: string;
+    method: string;
+    not_confirmed: string;
+    october_planning_forecast_m3: number;
+    evaluation: { points: number; mae_m3: number; rmse_m3: number; bias_m3: number; mape: number | null; mape_note: string } | null;
+    lines: { plant_name: string; product_name: string; statistical_forecast_m3: number; planner_adjustment_m3: number; planning_forecast_m3: number }[];
+    october_weeks?: { week: string; confirmed_m3: number; forecast_class_in_book_m3: number; planning_demand_m3: number }[];
+  } | null>(null);
+  const [tab, setTab] = useState<"book" | "planning" | "quality" | "intake">("book");
 
   function load(next = filters) {
     const params = new URLSearchParams();
@@ -66,6 +78,9 @@ export function DemandPage() {
 
   useEffect(() => {
     api<Meta>("/api/meta").then(setMeta).catch((err: Error) => setError(err.message));
+    api<NonNullable<typeof quality>>("/api/quality").then(setQuality).catch(() => undefined);
+    api<NonNullable<typeof planning>>("/api/planning-view").then(setPlanning).catch(() => undefined);
+    api<NonNullable<typeof forecast>>("/api/forecast").then(setForecast).catch(() => undefined);
     load(EMPTY_FILTER);
     // initial load only
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -112,8 +127,78 @@ export function DemandPage() {
         title="Demand Hub"
         lede="Internal projects and external customers sit in the same table. Extraction prepares a line. It does not decide who gets capacity."
       />
+      <div className="btn-row">
+        {(["book", "planning", "quality", "intake"] as const).map((name) => (
+          <button key={name} className={tab === name ? "btn primary" : "btn"} onClick={() => setTab(name)}>
+            {name === "book" ? "Demand book" : name === "planning" ? "Demand planning" : name === "quality" ? "Data quality" : "Intake"}
+          </button>
+        ))}
+      </div>
+      {tab === "quality" && quality ? (
+        <Panel title="Data quality before allocation" sub={`${quality.quality_percent}% of checks passed. ${quality.failed} failed. ${quality.quality_meaning}`}>
+          <p className="note">{quality.synthetic_note}</p>
+          {quality.issues.length === 0 ? <p>No failed checks on the current book.</p> : (
+            <ul>{quality.issues.slice(0, 8).map((issue) => <li key={issue.message}>{issue.message}</li>)}</ul>
+          )}
+        </Panel>
+      ) : null}
+      {tab === "planning" ? (
+        <Panel title="Demand planning" sub="Synthetic history. The forecast is not a confirmed order.">
+          {planning ? <p className="note">October book: confirmed {m3(planning.by_confidence_m3.Confirmed ?? 0)}, probable {m3(planning.by_confidence_m3.Probable ?? 0)}, forecast-class lines already in the book {m3(planning.by_confidence_m3.Forecast ?? 0)}. {planning.certainty_note} {planning.forecast_method}</p> : null}
+          {forecast ? (
+            <>
+              <p>{forecast.label}</p>
+              <p className="note">{forecast.method}</p>
+              <p className="note">{forecast.not_confirmed}</p>
+              {forecast.evaluation ? (
+                <p>Backtest on {forecast.evaluation.points} plant-product months. MAE {m3(forecast.evaluation.mae_m3)}. RMSE {m3(forecast.evaluation.rmse_m3)}. Bias {m3(forecast.evaluation.bias_m3)}. {forecast.evaluation.mape == null ? "MAPE withheld." : `MAPE ${(forecast.evaluation.mape * 100).toFixed(1)}%.`} {forecast.evaluation.mape_note}</p>
+              ) : null}
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr><th>Plant</th><th>Product</th><th className="num">Statistical forecast</th><th className="num">Planner adjustment</th><th className="num">Planning forecast</th></tr>
+                  </thead>
+                  <tbody>
+                    {forecast.lines.map((line) => (
+                      <tr key={`${line.plant_name}-${line.product_name}`}>
+                        <td>{line.plant_name}</td>
+                        <td>{line.product_name}</td>
+                        <td className="num">{m3(line.statistical_forecast_m3)}</td>
+                        <td className="num">{m3(line.planner_adjustment_m3)}</td>
+                        <td className="num">{m3(line.planning_forecast_m3)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="note">October planning forecast across plants and products: {m3(forecast.october_planning_forecast_m3)}. A person can add a forecast-class line to the book. The allocator does not import this table by itself.</p>
+              {forecast.october_weeks ? (
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr><th>Week</th><th className="num">Confirmed</th><th className="num">Forecast-class in the book</th><th className="num">Planning demand</th></tr>
+                    </thead>
+                    <tbody>
+                      {forecast.october_weeks.map((week) => (
+                        <tr key={week.week}>
+                          <td>{week.week}</td>
+                          <td className="num">{m3(week.confirmed_m3)}</td>
+                          <td className="num">{m3(week.forecast_class_in_book_m3)}</td>
+                          <td className="num">{m3(week.planning_demand_m3)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+              <p className="note">Planning demand here is the October order book. The statistical forecast above is not added into it.</p>
+            </>
+          ) : <p>Forecast is loading.</p>}
+        </Panel>
+      ) : null}
       {error ? <ErrorNote message={error} /> : null}
       {message ? <div className="banner good">{message}</div> : null}
+      {tab === "book" ? <>
       <div className="kpi-grid">
         <article className="kpi"><p>Showing</p><strong>{m3(totals.requested_m3)}</strong><span>{rows.length} lines</span></article>
         <article className="kpi"><p>Internal</p><strong>{m3(totals.internal_m3)}</strong></article>
@@ -240,8 +325,9 @@ export function DemandPage() {
           </div>
         </Panel>
       ) : null}
+      </> : null}
 
-      <Panel title="Prepare a demand line from text" sub="Rules stand in for OCR and document extraction. Confirm the draft before it joins the book.">
+      {tab === "intake" ? <Panel title="Prepare a demand line from text" sub="Rules stand in for OCR and document extraction. Confirm the draft before it joins the book.">
         <div className="btn-row" style={{ marginBottom: 10 }}>
           <button className="btn" onClick={() => { const sample = meta?.samples.ocr ?? ""; setText(sample); void extract("Simulated OCR", sample); }}>Simulate OCR</button>
           <button className="btn" onClick={() => { const sample = meta?.samples.email ?? ""; setText(sample); void extract("Email intake", sample); }}>Load sample email</button>
@@ -270,7 +356,7 @@ export function DemandPage() {
             ) : <p className="note">Extract a document to review the draft.</p>}
           </div>
         </div>
-      </Panel>
+      </Panel> : null}
     </div>
   );
 }

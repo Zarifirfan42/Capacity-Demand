@@ -31,6 +31,7 @@ type Impact = {
     excess_inventory_m3: number;
     excess_inventory_value_rm: number;
     working_capital_rm: number;
+    carrying_cost_rm: number;
     working_capital_note: string;
     inventory_consumed_value_rm: number;
     inventory_at_risk_rm: number;
@@ -76,29 +77,30 @@ export function ImpactPage() {
   if (error) return <ErrorNote message={error} />;
   if (!data) return <p>Calculating business impact…</p>;
 
+  const practice = data.columns.find((column) => column.key === "practice");
   const pilot = data.columns.find((column) => column.key === "pilot");
   const chart = [
     { name: "Margin", ...Object.fromEntries(data.columns.map((column) => [column.label, column.margin_at_risk_rm])) },
     { name: "Penalties", ...Object.fromEntries(data.columns.map((column) => [column.label, column.penalty_at_risk_rm])) },
     { name: "Programme delay", ...Object.fromEntries(data.columns.map((column) => [column.label, column.delay_cost_rm])) },
   ];
-  const colors = ["#8aa0b4", "#0e6b57", "#1d4e89"];
+  const colors = ["#8aa0b4", "#c4a35a", "#0e6b57", "#1d4e89"];
 
   return (
     <div className="page">
       <PageHeader
-        kicker="Baseline versus pilot"
+        kicker="Same demand, same capacity"
         title="Business Impact"
-        lede="Baseline is an earliest-required-date planner using the same plants, products, and dates. The pilot is the consequence-minimising allocation. Approved figures replace a bucket only after a person records a decision."
+        lede="Every column uses the same plants, products, dates, inventory, and financial assumptions. Only the allocation rule changes. The current-practice proxy is an illustration of informal deal-by-deal planning. It is not an observed history."
       />
       <div className="banner good">
-        <strong>Estimated value protected versus earliest-date planning: {rm(data.value_protected_rm)}</strong>
-        {data.value_protected_note}
+        <strong>Modelled gap versus the current-practice proxy: {rm(data.value_protected_rm)}</strong>
+        Proxy expected consequence {rm(practice?.expected_consequence_rm)} minus the optimised recommendation {rm(pilot?.expected_consequence_rm)}. {data.value_protected_note} This is a modelled gap on the synthetic book, not observed savings.
       </div>
       <div className="kpi-grid">
-        <Kpi label="Inventory value" value={rm(data.inventory.inventory_value_rm)} hint="Assumption. On-hand × prototype unit cost." />
+        <Kpi label="Inventory value" value={rm(data.inventory.inventory_value_rm)} hint="On-hand × assumed unit cost. This balance is not the carrying cost." />
         <Kpi label="Excess inventory" value={rm(data.inventory.excess_inventory_value_rm)} hint={`${m3(data.inventory.excess_inventory_m3)} above safety stock and 14-day demand.`} />
-        <Kpi label="Working capital tied up" value={rm(data.inventory.working_capital_rm)} hint={data.inventory.working_capital_note} />
+        <Kpi label="Carrying cost this horizon" value={rm(data.inventory.carrying_cost_rm)} hint={data.inventory.working_capital_note} />
         <Kpi label="Margin deferred in the pilot" value={rm(pilot?.margin_at_risk_rm)} tone="risk" />
         <Kpi label="Programme days in the pilot" value={num(pilot?.programme_days, 1)} tone="risk" hint={`Delay cost ${rm(pilot?.delay_cost_rm)}`} />
         <Kpi label="Emergency actions worth pricing" value={rm(data.expedite.emergency_cost_if_clearing_worthwhile_shortfalls_rm)} hint={`Assumption. Net benefit if approved: ${rm(data.expedite.net_benefit_if_those_are_expedited_rm)}.`} />

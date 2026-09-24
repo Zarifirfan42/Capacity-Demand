@@ -89,6 +89,7 @@ export type AllocationLine = {
   expected_consequence_rm: number;
   rank_by_expected_consequence: number;
   reason: string;
+  why_not?: string;
   notes: string;
 };
 
@@ -133,6 +134,13 @@ export type Bucket = {
     requested_m3: number;
     bullets: string[];
   }[];
+  inventory_projection?: {
+    opening_on_hand_m3: number;
+    drawn_from_inventory_m3: number;
+    produced_for_allocation_m3: number;
+    projected_closing_on_hand_m3: number;
+    basis: string;
+  };
   expedite_screen: {
     customer_or_project: string;
     unserved_quantity: number;
@@ -144,6 +152,13 @@ export type Bucket = {
     net_benefit_rm: number;
     comparison_basis: string;
   }[];
+  decision_review?: {
+    level: string;
+    owner: string;
+    triggers: string[];
+    evidence: string;
+    assumption: boolean;
+  };
   explanation: {
     paragraphs: string[];
     ranking: string[];
@@ -169,6 +184,14 @@ export type AllocationResult = {
   };
   buckets: Bucket[];
   assumptions: string[];
+  model?: {
+    decision_variables: string[];
+    objective: string;
+    constraints: string[];
+    solver: string;
+    not_in_the_objective: string[];
+    forecast_limit: string;
+  };
 };
 
 export type DecisionRow = {

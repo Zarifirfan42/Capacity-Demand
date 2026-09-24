@@ -24,6 +24,7 @@ export function AllocationPage() {
   const [key, setKey] = useState("");
   const [edits, setEdits] = useState<Record<number, number>>({});
   const [reason, setReason] = useState("Accepted the recommendation.");
+  const [category, setCategory] = useState("Other");
   const [preview, setPreview] = useState<Preview | null>(null);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState("");
@@ -93,6 +94,7 @@ export function AllocationPage() {
           plant_id: bucket.plant_id,
           product_id: bucket.product_id,
           override_reason: reason,
+          reason_category: category,
           allocations: bucket.allocations.map((line) => ({
             demand_id: line.demand_id,
             allocated_quantity: Number(edits[line.demand_id] ?? 0),
@@ -146,7 +148,16 @@ export function AllocationPage() {
         <Kpi label="Margin left open" value={rm(bucket.margin_at_risk_rm)} />
       </div>
 
-      <Panel title="Why this allocation" sub="The ranking is ringgit consequence per cubic metre, weighted by confidence. It is not an internal or external rule.">
+      {bucket.decision_review ? (
+        <Panel title="Who reviews this recommendation" sub={bucket.decision_review.level}>
+          <p><strong>{bucket.decision_review.owner}</strong></p>
+          <p>{bucket.decision_review.evidence}</p>
+          {bucket.decision_review.triggers.length ? <ul>{bucket.decision_review.triggers.map((item) => <li key={item}>{item}</li>)}</ul> : null}
+          <p className="note">The review lines are modelling assumptions. They are not a head-office policy.</p>
+        </Panel>
+      ) : null}
+
+      <Panel title="Why this allocation" sub="The ranking is expected ringgit consequence per cubic metre, scaled by a planning-certainty weight. It is not an internal or external rule.">
         <div className="explain">
           {bucket.explanation.paragraphs.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
           <ol className="ranking">
@@ -225,7 +236,7 @@ export function AllocationPage() {
                       onChange={(event) => setEdits({ ...edits, [line.demand_id]: Number(event.target.value) })}
                     />
                   </td>
-                  <td className="reason">{line.reason}</td>
+                  <td className="reason">{line.why_not || line.reason}</td>
                 </tr>
               ))}
             </tbody>
@@ -244,6 +255,19 @@ export function AllocationPage() {
             ) : null}
           </div>
         ) : null}
+        {bucket.inventory_projection ? (
+          <p className="note">
+            Projected stock: opening {m3(bucket.inventory_projection.opening_on_hand_m3)}, drawn {m3(bucket.inventory_projection.drawn_from_inventory_m3)}, produced for this allocation {m3(bucket.inventory_projection.produced_for_allocation_m3)}, closing on-hand {m3(bucket.inventory_projection.projected_closing_on_hand_m3)}. {bucket.inventory_projection.basis}
+          </p>
+        ) : null}
+        <div className="field">
+          <label>If you change the recommendation, why?</label>
+          <select value={category} onChange={(event) => setCategory(event.target.value)}>
+            {["Customer commitment", "Project criticality", "Contractual obligation", "Operational constraint", "Management decision", "Data issue", "Other"].map((item) => (
+              <option key={item}>{item}</option>
+            ))}
+          </select>
+        </div>
         <div className="field grow">
           <label>Reason for the decision</label>
           <textarea value={reason} onChange={(event) => setReason(event.target.value)} />
@@ -313,6 +337,18 @@ export function AllocationPage() {
           {decisions.filter((row) => row.plant_name === bucket.plant_name && row.product_name === bucket.product_name).length === 0 ? <p className="note">Nothing recorded for this plant and product yet.</p> : null}
         </div>
       </Panel>
+      {result.model ? (
+        <Panel title="How the recommendation is calculated" sub={result.model.solver}>
+          <p>{result.model.objective}</p>
+          <p className="note">Decision variables</p>
+          <ul>{result.model.decision_variables.map((item) => <li key={item}>{item}</li>)}</ul>
+          <p className="note">Constraints</p>
+          <ul>{result.model.constraints.map((item) => <li key={item}>{item}</li>)}</ul>
+          <p className="note">Left out of the objective on purpose</p>
+          <ul>{result.model.not_in_the_objective.map((item) => <li key={item}>{item}</li>)}</ul>
+          <p className="note">{result.model.forecast_limit}</p>
+        </Panel>
+      ) : null}
       <Assumptions items={result.assumptions} />
     </div>
   );

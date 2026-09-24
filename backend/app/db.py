@@ -81,6 +81,25 @@ CREATE TABLE IF NOT EXISTS demands (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS demand_history (
+    id INTEGER PRIMARY KEY,
+    plant_id INTEGER NOT NULL REFERENCES plants(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    demand_type TEXT NOT NULL,
+    month_start TEXT NOT NULL,
+    quantity_m3 REAL NOT NULL,
+    UNIQUE (plant_id, product_id, demand_type, month_start)
+);
+
+CREATE TABLE IF NOT EXISTS forecast_adjustments (
+    plant_id INTEGER NOT NULL REFERENCES plants(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    month_start TEXT NOT NULL,
+    adjustment_m3 REAL NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (plant_id, product_id, month_start)
+);
+
 CREATE TABLE IF NOT EXISTS decisions (
     id INTEGER PRIMARY KEY,
     created_at TEXT NOT NULL,
@@ -101,9 +120,15 @@ CREATE TABLE IF NOT EXISTS decisions (
 """
 
 
+def database_path() -> Path:
+    override = os.getenv("CDI_DB")
+    return Path(override) if override else DB_PATH
+
+
 def connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    path = database_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -112,6 +137,22 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _ensure_decision_columns(conn)
+
+
+def _ensure_decision_columns(conn: sqlite3.Connection) -> None:
+    """Add columns on databases created before the decision-history extension."""
+    present = {row[1] for row in conn.execute("PRAGMA table_info(decisions)").fetchall()}
+    additions = {
+        "reason_category": "TEXT NOT NULL DEFAULT ''",
+        "actual_json": "TEXT",
+        "actual_note": "TEXT NOT NULL DEFAULT ''",
+        "actual_recorded_at": "TEXT",
+        "actual_username": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, declaration in additions.items():
+        if name not in present:
+            conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {declaration}")
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
@@ -130,6 +171,8 @@ def reset_data(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         DELETE FROM decisions;
+        DELETE FROM forecast_adjustments;
+        DELETE FROM demand_history;
         DELETE FROM demands;
         DELETE FROM inventory;
         DELETE FROM capacity_calendar;

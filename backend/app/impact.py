@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 
 from app.db import connect, fetch_all
-from app.economics import ASSUMPTIONS, round_m3, round_rm
+from app.economics import ASSUMPTIONS, carrying_cost, round_m3, round_rm
 from app.engine import allocate, load_world
 
 
@@ -97,7 +97,12 @@ def _inventory(world: dict, result: dict) -> dict:
         "excess_inventory_m3": round_m3(excess_m3),
         "excess_inventory_value_rm": round_rm(excess_value),
         "working_capital_rm": round_rm(value),
-        "working_capital_note": "Assumption: on-hand inventory is paid and not yet billed, so its prototype unit value stands in for working capital tied up.",
+        "carrying_cost_rm": carrying_cost(value),
+        "carrying_rate_annual": 0.08,
+        "working_capital_note": (
+            "Inventory value is on-hand × the assumed unit cost. That balance is not the carrying cost. "
+            "Carrying cost for this 30-day horizon = inventory value × 8% a year × 30/365. The 8% rate is an assumption."
+        ),
         "inventory_consumed_value_rm": round_rm(consumed_value),
         "inventory_at_risk_rm": round_rm(constrained_on_hand_value),
         "lines": lines,
@@ -142,7 +147,8 @@ def _latest_decisions() -> list[dict]:
 def build_impact() -> dict:
     result = allocate(None)
     world = load_world()
-    baseline = _policy_sum(result, "earliest")
+    practice = _policy_sum(result, "practice")
+    earliest = _policy_sum(result, "earliest")
     internal = _policy_sum(result, "internal")
     external = _policy_sum(result, "external")
     pilot = _policy_sum(result, "optimised")
@@ -170,15 +176,17 @@ def build_impact() -> dict:
         approved_notes.append("No allocation has been approved yet. The approved column matches the recommendation until a planner records a decision.")
     inventory = _inventory(world, result)
     expedite = _expedite(result)
-    value_protected = round_rm(baseline["expected_consequence_rm"] - pilot["expected_consequence_rm"])
+    value_protected = round_rm(practice["expected_consequence_rm"] - pilot["expected_consequence_rm"])
+    value_vs_earliest = round_rm(earliest["expected_consequence_rm"] - pilot["expected_consequence_rm"])
     return {
         "horizon": result["horizon"],
-        "baseline_name": "Baseline — earliest required date",
-        "pilot_name": "Pilot — minimise business consequence",
+        "baseline_name": "Current practice proxy — illustrative, not observed history",
+        "pilot_name": "Optimised — minimise business consequence",
         "approved_name": "Approved — human decision where recorded",
         "columns": [
-            {"key": "baseline", "label": "Baseline", "detail": "Earliest required date, scheduled onto the same capacity.", **baseline},
-            {"key": "pilot", "label": "Pilot recommendation", "detail": "Linear programme. No internal or external preference.", **pilot},
+            {"key": "practice", "label": "Current practice proxy", "detail": "Illustrative informal rule on the same demand and capacity. Not an observed Chin Hin history.", **practice},
+            {"key": "earliest", "label": "Earliest required date", "detail": "A named priority rule. This is not a claim about how the business allocates today.", **earliest},
+            {"key": "pilot", "label": "Optimised", "detail": "Linear programme. No internal or external preference.", **pilot},
             {"key": "approved", "label": "Approved plan", "detail": "Latest human decision on each plant and product, otherwise the recommendation.", **approved},
         ],
         "reference_policies": [
@@ -188,7 +196,8 @@ def build_impact() -> dict:
         "inventory": inventory,
         "expedite": expedite,
         "value_protected_rm": value_protected,
-        "value_protected_note": "Expected consequence of the earliest-date rule minus expected consequence of the recommendation. This is the consequence the pilot avoids.",
+        "value_protected_vs_earliest_rm": value_vs_earliest,
+        "value_protected_note": "Expected consequence of the current-practice proxy minus the optimised recommendation, on the same demand and capacity. The proxy is illustrative. The earliest-date comparison is reported separately and is not current practice.",
         "approved_buckets": len(covered),
         "approved_notes": approved_notes,
         "decisions": [

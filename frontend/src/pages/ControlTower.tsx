@@ -40,6 +40,7 @@ type Tower = {
   }[];
   policy_totals: { optimised_rm: number; earliest_rm: number; internal_first_rm: number; external_first_rm: number };
   recent_decisions: DecisionRow[];
+  exceptions?: { tone: string; text: string; plant_id: number; product_id: number }[];
 };
 
 export function ControlTowerPage() {
@@ -73,6 +74,17 @@ export function ControlTowerPage() {
         <strong>The month is not short of cubic metres. It is short on the dates that matter.</strong>
         {data.insight}
       </div>
+      {data.exceptions && data.exceptions.length > 0 ? (
+        <Panel title="Where to act" sub="Constrained plant and product books. Open one to see who is left short, and why.">
+          <ul>
+            {data.exceptions.map((row) => (
+              <li key={`${row.plant_id}-${row.product_id}`}>
+                <Link to={`/allocation?plant=${row.plant_id}&product=${row.product_id}`}>{row.text}</Link>
+              </li>
+            ))}
+          </ul>
+        </Panel>
+      ) : null}
       <div className="kpi-grid">
         <Kpi label="Total demand" value={m3(k.total_demand_m3)} hint="Internal and external orders in one book" />
         <Kpi label="Available capacity" value={m3(k.available_capacity_m3)} hint={`Plus ${m3(k.usable_inventory_m3)} usable inventory`} />
@@ -82,7 +94,7 @@ export function ControlTowerPage() {
         <Kpi label="Inventory at risk" value={rm(k.inventory_at_risk_rm)} hint={k.inventory_at_risk_note} />
         <Kpi label="Margin at risk" value={rm(k.margin_at_risk_rm)} tone="risk" hint="Contribution margin on the unserved fraction" />
         <Kpi label="Programme days at risk" value={num(k.programme_days_at_risk, 1)} tone="risk" hint="Internal delay days scaled by the unserved fraction" />
-        <Kpi label="Estimated value protected" value={rm(k.value_protected_rm)} tone="good" hint="Expected consequence avoided versus serving the earliest date first" />
+        <Kpi label="Modelled gap vs practice proxy" value={rm(k.value_protected_rm)} tone="good" hint="Expected consequence avoided versus the illustrative current-practice proxy. Not observed savings, and not an earliest-date comparison." />
       </div>
 
       <div className="split">

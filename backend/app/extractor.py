@@ -261,5 +261,28 @@ def extract_demand(text: str, plants: list[dict], products: list[dict], source: 
         "delay_cost_per_day": delay_cost,
         "source": source,
         "notes": "Prepared from unstructured text. A person must confirm this line before it affects allocation.",
+        "validation_status": "Pending",
     }
-    return {"ok": ok, "warnings": warnings, "draft": draft, "steps": steps, "source_label": source}
+    signals = [
+        quantity is not None,
+        required is not None,
+        plant is not None,
+        product is not None,
+        margin > 0,
+        bool(customer) and not customer.startswith("Unnamed"),
+    ]
+    extraction_confidence = round(sum(1 for signal in signals if signal) / len(signals), 2)
+    draft["extraction_confidence"] = extraction_confidence
+    steps.append(
+        f"Extraction confidence {extraction_confidence:.0%}. This is how many of the core fields were read, not a model probability. "
+        "The line stays out of the allocation book until a person adds it."
+    )
+    return {
+        "ok": ok,
+        "warnings": warnings,
+        "draft": draft,
+        "steps": steps,
+        "source_label": source,
+        "extraction_confidence": extraction_confidence,
+        "validation_status": "Pending",
+    }
