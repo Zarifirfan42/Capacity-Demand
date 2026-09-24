@@ -171,7 +171,12 @@ def live_metrics() -> dict:
         decisions = fetch_all(conn, "SELECT * FROM decisions WHERE status != 'replaced' ORDER BY id")
         snapshots = fetch_all(conn, "SELECT * FROM inventory_snapshots ORDER BY as_of_date")
         expedites = fetch_all(conn, "SELECT * FROM expedite_decisions ORDER BY id")
-        demands = fetch_all(conn, "SELECT plant_id, product_id, required_date, requested_quantity FROM demands")
+        demands = fetch_all(
+            conn,
+            "SELECT plant_id, product_id, required_date, requested_quantity, economics_basis FROM demands",
+        )
+        incomplete_n = sum(1 for row in demands if row.get("economics_basis") == "default_assumption")
+        demands = [row for row in demands if row.get("economics_basis") != "default_assumption"]
         products = fetch_all(conn, "SELECT * FROM products")
     paired = [float(row["paired_gap_rm"]) for row in plans]
     cash_paid = 0.0
@@ -214,6 +219,7 @@ def live_metrics() -> dict:
         },
         "forecast_diagnostic": last_value_naive(),
         "override_learning": override_learning(),
+        "default_margin_lines_excluded": incomplete_n,
     }
 
 

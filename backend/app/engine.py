@@ -15,6 +15,7 @@ import pulp
 from app.db import connect, fetch_all
 from app.economics import (
     ASSUMPTIONS,
+    assumptions_with_margins,
     CONFIDENCE_FACTOR,
     CRITICALITY_MULT,
     EMERGENCY_CAPACITY_SHARE,
@@ -810,6 +811,8 @@ def _line_view(demand: dict, slot: dict, rank: int, emergency: float, emergency_
         "from_production_m3": slot["from_production"],
         "production_by_day": slot.get("by_day") or [],
         "notes": demand.get("notes") or "",
+        "economics_basis": demand.get("economics_basis") or "entered",
+        "economics_badge": "Economics incomplete" if demand.get("economics_basis") == "default_assumption" else "",
         "emergency_cost_per_m3": emergency,
         "emergency_cost_is_assumption": emergency_is_assumption,
     }
@@ -2007,6 +2010,49 @@ def _shared_plans(world: dict, plant_id: int, product_ids: list[int]) -> dict[in
     return plans
 
 
+def _headline_world(world: dict) -> dict:
+    """Headline savings drop lines that sit on a default margin. The recommendation does not."""
+    if not any(row.get("economics_basis") == "default_assumption" for row in world.get("demands") or []):
+        return world
+    copied = deepcopy(world)
+    copied["demands"] = [row for row in world["demands"] if row.get("economics_basis") != "default_assumption"]
+    return copied
+
+
+def _headline_numbers(buckets: list[dict]) -> dict:
+    optimised_expected = sum(bucket["expected_consequence_rm"] for bucket in buckets)
+    earliest_expected = sum(next(item["expected_consequence_rm"] for item in bucket["policies"] if item["policy_code"] == "earliest") for bucket in buckets)
+    internal_expected = sum(next(item["expected_consequence_rm"] for item in bucket["policies"] if item["policy_code"] == "internal") for bucket in buckets)
+    external_expected = sum(next(item["expected_consequence_rm"] for item in bucket["policies"] if item["policy_code"] == "external") for bucket in buckets)
+    practice_expected = sum(next(item["expected_consequence_rm"] for item in bucket["policies"] if item["policy_code"] == "practice") for bucket in buckets)
+    return {
+        "expected_consequence_rm": round_rm(optimised_expected),
+        "value_protected_vs_practice_rm": round_rm(practice_expected - optimised_expected),
+        "value_protected_vs_earliest_rm": round_rm(earliest_expected - optimised_expected),
+        "value_protected_vs_best_rule_rm": round_rm(sum(bucket["headline_gap"]["true_rm"] for bucket in buckets)),
+        "best_rule_by_bucket": [
+            {
+                "plant_name": bucket["plant_name"],
+                "product_name": bucket["product_name"],
+                "best_rule": bucket["headline_gap"].get("best_rule"),
+                "best_rule_label": bucket["headline_gap"].get("best_rule_label"),
+                "gap_rm": bucket["headline_gap"]["true_rm"],
+            }
+            for bucket in buckets
+            if bucket["constrained"]
+        ],
+        "headline_gap_if_scored_proportional_rm": round_rm(sum(bucket["headline_gap"]["if_scored_proportional_rm"] for bucket in buckets)),
+        "headline_gap_effect_rm": round_rm(sum(bucket["headline_gap"]["effect_rm"] for bucket in buckets)),
+        "headline_gap_note": buckets[0]["headline_gap"]["note"] if buckets else "",
+        "value_protected_vs_internal_first_rm": round_rm(internal_expected - optimised_expected),
+        "value_protected_vs_external_first_rm": round_rm(external_expected - optimised_expected),
+        "earliest_expected_consequence_rm": round_rm(earliest_expected),
+        "internal_first_expected_consequence_rm": round_rm(internal_expected),
+        "external_first_expected_consequence_rm": round_rm(external_expected),
+        "practice_expected_consequence_rm": round_rm(practice_expected),
+    }
+
+
 def allocate(scenario: dict | None = None, *, include_comparison: bool = True, include_expedite: bool = True, lex: bool = True) -> dict:
     return allocate_world(
         apply_scenario(load_world(), scenario),
@@ -2111,13 +2157,69 @@ def allocate_world(world: dict, *, include_comparison: bool = True, include_expe
         "practice_expected_consequence_rm": round_rm(practice_expected),
         "constrained_buckets": sum(1 for bucket in buckets if bucket["constrained"]),
     }
+    incomplete = [
+        row
+        for row in world["demands"]
+        if row.get("economics_basis") == "default_assumption" and float(row.get("requested_quantity") or 0) > 0.05
+    ]
+    with_expected = totals["expected_consequence_rm"]
+    without_expected = with_expected
+    if incomplete:
+        filtered = _headline_world(world)
+        affected = {(int(row["plant_id"]), int(row["product_id"])) for row in incomplete}
+        headline_buckets = []
+        for bucket in buckets:
+            key = (int(bucket["plant_id"]), int(bucket["product_id"]))
+            if key in affected:
+                headline_buckets.append(
+                    solve_bucket(
+                        filtered,
+                        key[0],
+                        key[1],
+                        include_comparison=include_comparison,
+                        include_expedite=False,
+                        lex=lex,
+                    )
+                )
+            else:
+                headline_buckets.append(bucket)
+        headline = _headline_numbers(headline_buckets)
+        without_expected = headline.pop("expected_consequence_rm")
+        for key in (
+            "value_protected_vs_practice_rm",
+            "value_protected_vs_earliest_rm",
+            "value_protected_vs_best_rule_rm",
+            "best_rule_by_bucket",
+            "headline_gap_if_scored_proportional_rm",
+            "headline_gap_effect_rm",
+            "headline_gap_note",
+            "value_protected_vs_internal_first_rm",
+            "value_protected_vs_external_first_rm",
+        ):
+            totals[key] = headline[key]
+    comparison = {
+        "n": len(incomplete),
+        "lines": [
+            {
+                "demand_code": row.get("demand_code"),
+                "customer_or_project": row.get("customer_or_project"),
+                "quantity_m3": round_m3(float(row.get("requested_quantity") or 0)),
+                "margin_rm": round_rm(float(row.get("contribution_margin") or 0)),
+            }
+            for row in incomplete
+        ],
+        "with_expected_consequence_rm": with_expected,
+        "without_expected_consequence_rm": without_expected,
+        "note": "The recommendation includes lines on the default margin. Headline savings and Measurement leave those lines out.",
+    }
     return {
         "scenario_name": world.get("scenario_name") or "Baseline",
         "scenario_notes": world.get("scenario_notes") or [],
         "horizon": {"start": HORIZON_START, "end": HORIZON_END},
         "solver": "CBC mixed-integer programme",
         "objective": buckets[0]["objective"] if buckets else "",
-        "assumptions": ASSUMPTIONS,
+        "assumptions": assumptions_with_margins(world["demands"], world["products"]),
+        "economics_incomplete": comparison,
         "model": {
             "decision_variables": [
                 "For each order: cubic metres taken from usable inventory.",
@@ -2308,8 +2410,8 @@ def value_protected_band(base: dict | None = None) -> dict:
     if base is None:
         base = allocate(None, include_comparison=False, include_expedite=False)
     seeded = float(base["totals"]["value_protected_vs_best_rule_rm"])
-    linear = allocate_world(_retarget_types(load_world(), "linear"), include_comparison=False, include_expedite=False)
-    lump = allocate_world(_retarget_types(load_world(), "lump"), include_comparison=False, include_expedite=False)
+    linear = allocate_world(_retarget_types(_headline_world(load_world()), "linear"), include_comparison=False, include_expedite=False)
+    lump = allocate_world(_retarget_types(_headline_world(load_world()), "lump"), include_comparison=False, include_expedite=False)
     linear_gap = float(linear["totals"]["value_protected_vs_best_rule_rm"])
     lump_gap = float(lump["totals"]["value_protected_vs_best_rule_rm"])
     cases = [
@@ -2543,7 +2645,8 @@ def control_tower() -> dict:
             "external_first_rm": totals["external_first_expected_consequence_rm"],
             "practice_rm": totals["practice_expected_consequence_rm"],
         },
-        "assumptions": ASSUMPTIONS,
+        "assumptions": result.get("assumptions") or ASSUMPTIONS,
+        "economics_incomplete": result.get("economics_incomplete"),
     }
 
 

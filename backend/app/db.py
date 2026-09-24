@@ -287,6 +287,7 @@ def _ensure_decision_columns(conn: sqlite3.Connection) -> None:
         "required_signatories_json": "TEXT NOT NULL DEFAULT '[]'",
         "hold_json": "TEXT",
         "preparer_role": "TEXT NOT NULL DEFAULT ''",
+        "demo": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, declaration in additions.items():
         if name not in present:
@@ -305,6 +306,10 @@ def _ensure_demand_columns(conn: sqlite3.Connection) -> None:
         "minimum_useful_delivery_m3": "REAL NOT NULL DEFAULT 0",
         "owner_name": "TEXT NOT NULL DEFAULT ''",
         "owner_role": "TEXT NOT NULL DEFAULT ''",
+        "economics_basis": "TEXT NOT NULL DEFAULT 'entered'",
+        "penalty_acknowledged": "INTEGER NOT NULL DEFAULT 1",
+        "delay_acknowledged": "INTEGER NOT NULL DEFAULT 1",
+        "demo": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, declaration in additions.items():
         if name not in present:

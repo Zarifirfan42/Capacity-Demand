@@ -1,5 +1,7 @@
 {
   "generated_on": "2026-09-24",
+  "suite": "regression",
+  "evidence": "Scores on this file are a regression check of the rules. They are not accuracy evidence. Only a held-out set counts.",
   "eval_file": "intake_eval.json",
   "text_cases": 14,
   "image_cases": 3,
@@ -7,39 +9,26 @@
     "status": "measured",
     "per_field_accuracy": {
       "intent": 1.0,
-      "customer_contains": 0.923,
+      "customer_contains": 1.0,
       "demand_type": 1.0,
       "plant": 1.0,
       "product": 1.0,
       "quantity": 1.0,
       "required_date": 1.0,
       "commercial_blank": 1.0,
-      "draft_count": 0.0,
+      "draft_count": 1.0,
       "absent_from_model": 1.0
     },
-    "overall": 0.98,
+    "overall": 1.0,
     "checks": 100,
-    "failures": [
-      {
-        "id": "two-orders",
-        "field": "draft_count",
-        "expected": 2,
-        "actual": 1
-      },
-      {
-        "id": "change-sunway",
-        "field": "customer_contains",
-        "expected": "Sunway",
-        "actual": ""
-      }
-    ],
+    "failures": [],
     "confidence_calibration": {
       "score": "regex extraction_confidence. This is a count of filled fields, not a model probability.",
       "threshold": 0.7,
       "n_at_or_above": 10,
-      "fully_correct_at_or_above": 8,
-      "reliability": 0.8,
-      "note": "The 0.7 cut-off was checked on this regex score. A live model threshold was not calibrated."
+      "fully_correct_at_or_above": 10,
+      "reliability": 1.0,
+      "note": "This fraction counts filled-field cases on the regression file. It is not calibration and it is not accuracy evidence. Only a held-out set counts."
     }
   },
   "llm": {

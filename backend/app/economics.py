@@ -81,6 +81,7 @@ ASSUMPTIONS = [
     "Emergency capacity is an optional top-up, capped at 30% of that day's available capacity and priced at the assumed emergency cost per cubic metre. It is a proposal for approval. It is not added to base capacity. The expedite screen prices the cubic metres needed to get back under a lump trigger, and ranks orders by penalty and delay avoided per ringgit of that cost.",
     "A partial allocation that leaves penalty and delay unchanged versus missing the whole order is labelled partial service with no penalty avoided. Minimum useful delivery is cubic metres, default zero, and a positive value forces the solver to deliver at least that much or nothing.",
     "The recommendation minimises the objective the gap is scored on, so the gap is at least zero in every contract world. The magnitude is meaningful only if the seeded inputs are.",
+    "A line saved on the product default margin stays in the allocation objective and is badged Economics incomplete. Headline savings and Measurement leave that line out. The default is the median contribution margin per m³ of seeded lines for that product. The derivation is listed with these assumptions.",
 ]
 
 
@@ -90,6 +91,82 @@ def round_m3(value: float) -> float:
 
 def round_rm(value: float) -> float:
     return round(float(value), 2)
+
+
+def default_margin_register(demands: list[dict], products: list[dict]) -> list[dict]:
+    """Median margin per m³ on seeded lines. Intake and demo rows are left out."""
+    names = {int(row["id"]): row for row in products}
+    grouped: dict[int, list[float]] = {}
+    for row in demands:
+        if row.get("economics_basis") not in (None, "", "entered"):
+            continue
+        if int(row.get("demo") or 0) == 1:
+            continue
+        code = str(row.get("demand_code") or "")
+        if "-IN-" in code:
+            continue
+        quantity = float(row.get("requested_quantity") or 0)
+        if quantity <= 0:
+            continue
+        grouped.setdefault(int(row["product_id"]), []).append(float(row.get("contribution_margin") or 0) / quantity)
+    register = []
+    for product_id, rates in sorted(grouped.items()):
+        ordered = sorted(rates)
+        mid = len(ordered) // 2
+        median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+        product = names.get(product_id, {})
+        register.append(
+            {
+                "product_id": product_id,
+                "product_code": product.get("code") or "",
+                "product_name": product.get("name") or "",
+                "per_m3": round(median, 2),
+                "n": len(ordered),
+                "rates_per_m3": [round(rate, 2) for rate in ordered],
+            }
+        )
+    return register
+
+
+def default_margin_notes(register: list[dict]) -> list[str]:
+    notes = []
+    for row in register:
+        rates = ", ".join(f"RM{rate:.2f}" for rate in row["rates_per_m3"])
+        notes.append(
+            f"Default margin for {row['product_name']} ({row['product_code']}) is RM{row['per_m3']:.2f} per m³. "
+            f"Median of contribution margin ÷ requested m³ on {row['n']} seeded lines with economics entered: {rates}."
+        )
+    return notes
+
+
+def assumptions_with_margins(demands: list[dict], products: list[dict]) -> list[str]:
+    return [*ASSUMPTIONS, *default_margin_notes(default_margin_register(demands, products))]
+
+
+def apply_line_economics(draft: dict, body: dict, register: list[dict]) -> None:
+    """Refuse a save that leaves margin, penalty, or delay cost blank without an explicit choice."""
+    quantity = float(draft.get("requested_quantity") or 0)
+    margin = float(draft.get("contribution_margin") or 0)
+    penalty = float(draft.get("contractual_penalty") or 0)
+    days = float(draft.get("delay_days_if_unserved") or 0)
+    daily = float(draft.get("delay_cost_per_day") or 0)
+    by_product = {int(row["product_id"]): row for row in register}
+    if margin <= 0:
+        if not body.get("accept_default_margin"):
+            raise ValueError("Type a contribution margin, or accept the default margin per m³ for this product.")
+        product = by_product.get(int(draft["product_id"]))
+        if product is None:
+            raise ValueError("No seeded margin exists for this product, so a default cannot be derived. Type the margin.")
+        draft["contribution_margin"] = round(float(product["per_m3"]) * quantity, 2)
+        draft["economics_basis"] = "default_assumption"
+    else:
+        draft["economics_basis"] = "entered"
+    if penalty <= 0 and not body.get("acknowledge_zero_penalty"):
+        raise ValueError("Penalty is zero. Confirm there is no contractual penalty, or type the amount.")
+    if (days <= 0 or daily <= 0) and not body.get("acknowledge_zero_delay"):
+        raise ValueError("Delay cost is zero. Confirm there is no delay cost, or type the days and the daily rate.")
+    draft["penalty_acknowledged"] = 1 if penalty > 0 or body.get("acknowledge_zero_penalty") else 0
+    draft["delay_acknowledged"] = 1 if (days > 0 and daily > 0) or body.get("acknowledge_zero_delay") else 0
 
 
 def confidence_factor(level: str) -> float:

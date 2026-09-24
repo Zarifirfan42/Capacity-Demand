@@ -205,9 +205,12 @@ def _parse_date_span(span: str, as_of: date) -> str | None:
     return None if relative is None else relative.isoformat()
 
 
+_LOAD_UNIT = r"tan|tonnes?|tons?|lori|lorry|lorries|trucks?|trips?"
+
+
 def _parse_quantity_span(span: str) -> tuple[float | None, str]:
-    if re.search(r"\btan\b", span, re.I):
-        return None, "A quantity in tan is flagged and not converted."
+    if re.search(rf"\b(?:{_LOAD_UNIT})\b", span, re.I) and not re.search(r"m(?:3|³)|kubik", span, re.I):
+        return None, "Load counts and tonnes are not converted to m³. Type the cubic metres."
     match = re.search(r"(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)", span)
     if not match:
         return None, "The quantity span has no number."
@@ -331,6 +334,13 @@ def _intent_of(text: str) -> tuple[str, str]:
 
 
 def _customer_span(text: str, fallback: str) -> str:
+    revise = re.search(
+        r"\b(?:revise|change|tukar|ubah)\s+(?:the\s+)?([A-Za-z][A-Za-z0-9&'./-]*(?:\s+[A-Za-z][A-Za-z0-9&'./-]*){0,5})\s+order\b",
+        text,
+        re.I,
+    )
+    if revise:
+        return revise.group(1).strip()[:80]
     labelled = re.search(r"(?:buyer|internal project|project|site)\s*:\s*(.+)", text, re.I)
     if labelled:
         chunk = labelled.group(1).strip().split("\n")[0]
@@ -357,7 +367,7 @@ def regex_fields(text: str, plants: list[dict], products: list[dict], source: st
     quantity_match = re.search(r"(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(?:m(?:3|³)|kubik)", text, re.I)
     date_match = re.search(r"(\d{1,2}\s+[A-Za-z]+\s+20\d{2}|20\d{2}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/20\d{2})", text)
     relative = RELATIVE_RE.search(text)
-    tan = re.search(r"\d[\d,.]*\s*tan\b", text, re.I)
+    load_unit = re.search(rf"\d[\d,.]*\s*(?:{_LOAD_UNIT})\b", text, re.I)
     plant_span = ""
     product_span = ""
     from app.extractor import _match_plant, _match_product
@@ -425,7 +435,7 @@ def regex_fields(text: str, plants: list[dict], products: list[dict], source: st
         "demand_type": _field(demand_type, type_span or customer_span or intent_span),
         "plant_name": _field(None if plant is None else plant["name"], plant_span),
         "product_code": _field(None if product is None else product["code"], product_span),
-        "quantity_m3": _field(None if tan and not quantity_match else draft.get("requested_quantity"), (tan.group(0) if tan and not quantity_match else (quantity_match.group(0) if quantity_match else ""))),
+        "quantity_m3": _field(None if load_unit and not quantity_match else draft.get("requested_quantity"), (load_unit.group(0) if load_unit and not quantity_match else (quantity_match.group(0) if quantity_match else ""))),
         "required_date": _field(draft.get("required_date"), date_span),
         "confidence_level": _field(level, level_span),
     }
@@ -717,6 +727,17 @@ def _diff(existing: dict, draft: dict, intent: str) -> dict:
     }
 
 
+def _order_chunks(text: str) -> list[str]:
+    matches = list(re.finditer(r"\d+(?:\.\d+)?\s*(?:m(?:3|³)|kubik)", text, re.I))
+    if len(matches) < 2:
+        return [text]
+    chunks = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        chunks.append(text[match.start() : end].strip(" ."))
+    return chunks
+
+
 def prepare_intake(
     text: str,
     source: str,
@@ -795,6 +816,15 @@ def prepare_intake(
         built = regex_fields(redacted, plants, products, source)
         packaged = package_from_fields(redacted, built, plants, products, anchor, source)
         steps.append("Regex read the message. A person still confirms the line.")
+    drafts = [packaged["draft"]]
+    draft_count = packaged["draft_count"]
+    if used == "regex":
+        chunks = _order_chunks(redacted)
+        if len(chunks) > 1:
+            packed = [package_from_fields(chunk, regex_fields(chunk, plants, products, source), plants, products, anchor, source) for chunk in chunks]
+            packaged = packed[0]
+            drafts = [row["draft"] for row in packed]
+            draft_count = len(drafts)
     warnings.extend(packaged["warnings"])
     steps.extend(packaged["steps"])
     duplicate = None
@@ -839,6 +869,7 @@ def prepare_intake(
         "latency_ms": latency_ms,
         "intent": packaged["intent"],
         "draft": packaged["draft"],
+        "drafts": drafts,
         "fields": packaged["fields"],
         "highlights": highlights_for(original if length_warning == "" else working, packaged["fields"]),
         "warnings": list(dict.fromkeys(warnings)),
@@ -851,7 +882,7 @@ def prepare_intake(
         "display_text": original,
         "redacted_for_model": redacted,
         "extraction_confidence": packaged["extraction_confidence"],
-        "draft_count": packaged["draft_count"],
+        "draft_count": draft_count,
         "order_mentions": packaged["order_mentions"],
         "low_confidence": packaged["low_confidence"],
     }
@@ -956,6 +987,11 @@ def confirm_intake(conn, body: dict, role: str, client_ip: str = "local") -> dic
             raise ValueError("Quantity is above 2,000 m³. Accept the check or change the number.")
         if required < HORIZON_START or required > HORIZON_END:
             raise ValueError(f"Required date must fall inside {HORIZON_START} to {HORIZON_END}.")
+        from app.economics import apply_line_economics, default_margin_register
+
+        demand_rows = [dict(row) for row in conn.execute("SELECT * FROM demands").fetchall()]
+        product_rows = [dict(row) for row in conn.execute("SELECT * FROM products").fetchall()]
+        apply_line_economics(draft, body, default_margin_register(demand_rows, product_rows))
         prefix = "INT" if draft.get("demand_type") == "Internal" else "EXT"
         seq = conn.execute("SELECT COUNT(*) AS n FROM demands WHERE demand_code LIKE ?", (f"{prefix}-IN-%",)).fetchone()["n"]
         code = f"{prefix}-IN-{int(seq) + 1:03d}"
@@ -969,8 +1005,9 @@ def confirm_intake(conn, body: dict, role: str, client_ip: str = "local") -> dic
                 demand_code, demand_type, customer_or_project, customer_type, plant_id, product_id,
                 required_date, requested_quantity, confirmed_quantity, demand_status, confidence_level,
                 contribution_margin, contractual_penalty, project_criticality, delay_days_if_unserved,
-                delay_cost_per_day, source, notes, created_at, owner_name, owner_role
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                delay_cost_per_day, source, notes, created_at, owner_name, owner_role,
+                economics_basis, penalty_acknowledged, delay_acknowledged, demo
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 code,
@@ -994,6 +1031,10 @@ def confirm_intake(conn, body: dict, role: str, client_ip: str = "local") -> dic
                 now,
                 str(body.get("owner_name") or ""),
                 str(body.get("owner_role") or ""),
+                draft.get("economics_basis") or "entered",
+                int(draft.get("penalty_acknowledged") or 0),
+                int(draft.get("delay_acknowledged") or 0),
+                1 if body.get("demo") else 0,
             ),
         )
         saved = {key: draft.get(key) for key in TRACKED}
@@ -1193,6 +1234,8 @@ def evaluate_regex() -> dict:
     reliable = [row for row in above if row["fully_correct"]]
     return {
         "generated_on": "2026-09-24",
+        "suite": "regression",
+        "evidence": "Scores on this file are a regression check of the rules. They are not accuracy evidence. Only a held-out set counts.",
         "eval_file": "intake_eval.json",
         "text_cases": len(payload["cases"]),
         "image_cases": len(payload.get("images") or []),
@@ -1208,7 +1251,7 @@ def evaluate_regex() -> dict:
                 "n_at_or_above": len(above),
                 "fully_correct_at_or_above": len(reliable),
                 "reliability": None if not above else round(len(reliable) / len(above), 3),
-                "note": "The 0.7 cut-off was checked on this regex score. A live model threshold was not calibrated.",
+                "note": "This fraction counts filled-field cases on the regression file. It is not calibration and it is not accuracy evidence. Only a held-out set counts.",
             },
         },
         "llm": {

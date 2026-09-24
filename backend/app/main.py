@@ -12,9 +12,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app.auth import auth_status, require_admin, require_roles, require_writer
+from app.auth import auth_status, read_role, require_admin, require_roles, require_writer
 from app.db import connect, fetch_all, fetch_one, persistence_backend, reset_data
-from app.economics import ASSUMPTIONS, HORIZON_END, HORIZON_START
+from app.economics import apply_line_economics, assumptions_with_margins, default_margin_register, HORIZON_END, HORIZON_START
 from app.engine import (
     allocate,
     apply_scenario,
@@ -143,8 +143,12 @@ class ConfirmIn(BaseModel):
     received_at: str | None = None
     contacts_kept_local: list[str] = []
     accept_ceiling: bool = False
+    accept_default_margin: bool = False
+    acknowledge_zero_penalty: bool = False
+    acknowledge_zero_delay: bool = False
     owner_name: str = ""
     owner_role: str = ""
+    demo: bool = False
 
 
 class DemandCreate(BaseModel):
@@ -165,6 +169,14 @@ class DemandCreate(BaseModel):
     delay_cost_per_day: float = Field(ge=0, le=100000000)
     source: str = "Email intake"
     notes: str = ""
+    accept_default_margin: bool = False
+    acknowledge_zero_penalty: bool = False
+    acknowledge_zero_delay: bool = False
+    demo: bool = False
+
+
+class DemoIn(BaseModel):
+    username: str = "Demo scheduler"
 
 
 class AllocationLineIn(BaseModel):
@@ -240,7 +252,8 @@ def meta() -> dict:
         "horizon": {"start": HORIZON_START, "end": HORIZON_END},
         "plants": world["plants"],
         "products": world["products"],
-        "assumptions": ASSUMPTIONS,
+        "assumptions": assumptions_with_margins(world["demands"], world["products"]),
+        "default_margins": default_margin_register(world["demands"], world["products"]),
         "confidence_levels": ["Confirmed", "Probable", "Forecast"],
         "demand_types": ["Internal", "External"],
         "criticality_levels": ["Critical", "High", "Medium", "Low", "n/a"],
@@ -408,14 +421,23 @@ def create_demand(body: DemandCreate, _: str = Depends(require_writer)) -> dict:
             raise HTTPException(status_code=400, detail="Plant or product was not recognised.")
         seq = fetch_one(conn, "SELECT COUNT(*) AS n FROM demands WHERE demand_code LIKE ?", (f"{prefix}-IN-%",))
         code = f"{prefix}-IN-{(seq['n'] if seq else 0) + 1:03d}"
+        draft = body.model_dump()
+        try:
+            apply_line_economics(
+                draft,
+                draft,
+                default_margin_register(fetch_all(conn, "SELECT * FROM demands"), fetch_all(conn, "SELECT * FROM products")),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         conn.execute(
             """
             INSERT INTO demands(
                 demand_code, demand_type, customer_or_project, customer_type, plant_id, product_id,
                 required_date, requested_quantity, confirmed_quantity, demand_status, confidence_level,
                 contribution_margin, contractual_penalty, project_criticality, delay_days_if_unserved,
-                delay_cost_per_day, source, notes, created_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                delay_cost_per_day, source, notes, created_at, economics_basis, penalty_acknowledged, delay_acknowledged, demo
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 code,
@@ -429,7 +451,7 @@ def create_demand(body: DemandCreate, _: str = Depends(require_writer)) -> dict:
                 body.confirmed_quantity,
                 body.demand_status.strip(),
                 body.confidence_level,
-                body.contribution_margin,
+                draft["contribution_margin"],
                 body.contractual_penalty,
                 body.project_criticality,
                 body.delay_days_if_unserved,
@@ -437,6 +459,10 @@ def create_demand(body: DemandCreate, _: str = Depends(require_writer)) -> dict:
                 body.source,
                 body.notes.strip(),
                 now,
+                draft["economics_basis"],
+                draft["penalty_acknowledged"],
+                draft["delay_acknowledged"],
+                1 if body.demo else 0,
             ),
         )
         row = fetch_one(conn, "SELECT * FROM demands WHERE demand_code = ?", (code,))
@@ -1279,6 +1305,45 @@ def approve_expedite(
         else:
             status = "awaiting_review"
     return {"id": expedite_id, "status": status}
+
+
+@app.get("/api/session")
+def session(role: str = Depends(read_role)) -> dict:
+    return {"role": role}
+
+
+@app.get("/api/queue")
+def get_queue(role: str = Depends(read_role), username: str = "") -> dict:
+    from app.queue import queue_for
+
+    return queue_for(role, username)
+
+
+_DEMO_ROLES = ("scheduler", "plant_supervisor", "project_planner", "commercial_owner", "admin")
+
+
+@app.post("/api/demo/start")
+def demo_start(body: DemoIn, _: str = Depends(require_roles(*_DEMO_ROLES))) -> dict:
+    from app.queue import start_demo
+
+    try:
+        return start_demo(body.username)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/demo/expire")
+def demo_expire(_: str = Depends(require_roles(*_DEMO_ROLES))) -> dict:
+    from app.queue import expire_demo
+
+    return expire_demo()
+
+
+@app.post("/api/demo/reset")
+def demo_reset(_: str = Depends(require_roles(*_DEMO_ROLES))) -> dict:
+    from app.queue import reset_demo
+
+    return reset_demo()
 
 
 @app.get("/api/cron/governance")

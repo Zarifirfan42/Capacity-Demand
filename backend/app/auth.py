@@ -58,5 +58,20 @@ def require_roles(*allowed: str):
     return checker
 
 
+def read_role(
+    x_demo_role: str | None = Header(default=None),
+    x_demo_passcode: str | None = Header(default=None),
+) -> str:
+    """Reads stay open for a viewer. A named role with the wrong passcode is 401."""
+    role = (x_demo_role or "viewer").strip().lower()
+    if role in ("", "viewer"):
+        return "viewer"
+    if role not in ROLE_ENV:
+        raise HTTPException(status_code=401, detail="Enter a role and its passcode before recording.")
+    if (x_demo_passcode or "") != passcode_for(role):
+        raise HTTPException(status_code=401, detail="The passcode does not match that role.")
+    return role
+
+
 require_writer = require_roles("scheduler")
 require_admin = require_roles("admin")

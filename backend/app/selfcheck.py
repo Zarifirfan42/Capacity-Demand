@@ -100,6 +100,8 @@ def main() -> None:
 
     intake = load_eval_results()
     assert intake["text_cases"] >= 12
+    assert intake.get("suite") == "regression"
+    assert "not accuracy evidence" in intake.get("evidence", "")
     assert intake["regex"]["status"] == "measured"
     assert intake["llm"]["status"] in ("not_run", "measured")
     if intake["llm"]["status"] == "measured":

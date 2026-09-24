@@ -246,6 +246,8 @@ def test_manual_and_model_confirm_times_are_reported_with_n(monkeypatch, tmp_pat
                 "extractor": "manual",
                 "confirm_seconds": 40,
                 "received_at": "2026-10-08T00:00:00+00:00",
+                "acknowledge_zero_penalty": True,
+                "acknowledge_zero_delay": True,
                 "draft": {
                     "demand_type": "External",
                     "customer_or_project": "Manual job",
@@ -257,7 +259,7 @@ def test_manual_and_model_confirm_times_are_reported_with_n(monkeypatch, tmp_pat
                     "confirmed_quantity": 12,
                     "demand_status": "Firm",
                     "confidence_level": "Confirmed",
-                    "contribution_margin": 0,
+                    "contribution_margin": 480,
                     "contractual_penalty": 0,
                     "delay_days_if_unserved": 0,
                     "delay_cost_per_day": 0,
@@ -292,7 +294,21 @@ def test_quantity_above_the_ceiling_needs_an_explicit_accept(monkeypatch, tmp_pa
     with connect() as conn:
         with pytest.raises(ValueError):
             confirm_intake(conn, {"action": "save_new", "intent": "new", "draft": draft, "source": "Manual"}, "scheduler")
-        saved = confirm_intake(conn, {"action": "save_new", "intent": "new", "draft": draft, "source": "Manual", "accept_ceiling": True, "extractor": "regex"}, "scheduler")
+        saved = confirm_intake(
+            conn,
+            {
+                "action": "save_new",
+                "intent": "new",
+                "draft": draft,
+                "source": "Manual",
+                "accept_ceiling": True,
+                "accept_default_margin": True,
+                "acknowledge_zero_penalty": True,
+                "acknowledge_zero_delay": True,
+                "extractor": "regex",
+            },
+            "scheduler",
+        )
     assert saved["created"] is True
 
 
@@ -313,3 +329,5 @@ def test_committed_eval_file_is_what_ci_reads(monkeypatch) -> None:
     assert saved["regex"]["overall"] == fresh["regex"]["overall"]
     assert saved["regex"]["failures"] == fresh["regex"]["failures"]
     assert saved["text_cases"] >= 12
+    assert saved["suite"] == "regression"
+    assert "not accuracy evidence" in saved["evidence"]

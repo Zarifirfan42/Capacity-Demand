@@ -26,7 +26,7 @@ Margin, contractual penalty, and delay cost are typed by a person. They are not 
 
 Each extracted value needs a span that appears verbatim in the message. If the span is missing, the field is cleared and the screen says so. Quantity has to be positive. Anything above 2,000 m³ is kept visible and blocked until the scheduler accepts it. A date outside 1–30 Oct 2026 is cleared. Plant and product have to match the seeded works and mixes. Relative dates such as “next Mon” or “Isnin depan” are resolved from 24 Sep 2026 and then checked against that horizon.
 
-Model confidence is stored and is not treated as a probability. The 0.7 cut-off was checked against the regex score on the eval set. The committed file records how often a case at or above 0.7 was fully correct. A live model threshold was not calibrated, because the model was not run.
+Model confidence is stored and is not treated as a probability. A 0.7 cut-off is stored with the draft. It was not calibrated on a live model, because the model has not been compared with the rules.
 
 The confirm screen shows the source text with those spans highlighted beside the fields.
 
@@ -70,11 +70,11 @@ The log stores a hash of the message, not the message.
 
 Expand model intake only when n is at least 20 and fewer than 30% of proposed fields are corrected. Below 20, show n and do not treat the rate as a decision.
 
-## Eval file
+## Regression suite
 
-`backend/app/intake_eval.json` holds 14 synthetic messages and 3 synthetic images (a typed delivery order, a skewed photo, a handwritten-style note).
+`backend/app/intake_eval.json` holds 14 synthetic messages and 3 synthetic images (a typed delivery order, a skewed photo, a handwritten-style note). These messages were written with the rules. Scores on them are a regression check.
 
-`backend/app/intake_eval_results.json` is the evidence CI reads. It does not call the API. The regex section is a measured score, including failures. The model section is `not_run` because `ANTHROPIC_API_KEY` was absent when the file was written. Vision is `not_run` for the same reason, and because `CDI_INTAKE_VISION` is off. If a later run with a key does not beat the regex score, write that in the file. That result is still the evidence.
+`backend/app/intake_eval_results.json` is what CI reads. It does not call the API. Scores on this file are not accuracy evidence. Only a held-out set counts. The model section is `not_run` because `ANTHROPIC_API_KEY` was absent when the file was written. Vision is `not_run` for the same reason, and because `CDI_INTAKE_VISION` is off. The model has not been compared with the rules. A fraction of filled-field cases on this file is not calibration.
 
 Photo reading stays behind `CDI_INTAKE_VISION=1` and only when the mode is `llm`. Image bytes are not stored. Mock mode does not send them.
 
@@ -82,7 +82,7 @@ Photo reading stays behind `CDI_INTAKE_VISION=1` and only when the mode is `llm`
 
 | Use | Judgement |
 | --- | --- |
-| Read a message into a line a person confirms | Use now |
+| Read a message into a line a person confirms | Use now, with a person confirming. The model has not been compared with the rules. |
 | Forecasting with a learned model | Premature |
 | A model chooses the allocation | Never |
 | Anomaly flags | Later |
