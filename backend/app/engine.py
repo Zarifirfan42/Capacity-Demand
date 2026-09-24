@@ -49,6 +49,35 @@ from app.economics import (
 TOL = 0.05
 
 
+def _buffer_days() -> int:
+    from app.db import connect, get_meta
+
+    try:
+        with connect() as conn:
+            raw = get_meta(conn, "buffer_days")
+    except Exception:
+        return 0
+    try:
+        return max(0, int(raw or 0))
+    except ValueError:
+        return 0
+
+
+def _schedule_deadline(required_date: str, penalty_type: str, buffer_days: int) -> str:
+    """Lump-sum orders can be pulled forward by buffer_days. Default 0 leaves the due date unchanged."""
+    if buffer_days <= 0 or penalty_type != "lump_sum":
+        return required_date
+    from datetime import date, timedelta
+
+    from app.economics import HORIZON_START
+
+    day = date.fromisoformat(required_date) - timedelta(days=buffer_days)
+    start = date.fromisoformat(HORIZON_START)
+    if day < start:
+        day = start
+    return day.isoformat()
+
+
 def _pretty(iso: str) -> str:
     parsed = datetime.strptime(iso, "%Y-%m-%d")
     return parsed.strftime("%d %b %Y").lstrip("0")
@@ -87,9 +116,11 @@ def load_world() -> dict:
         inventory = fetch_all(conn, "SELECT * FROM inventory")
         demands = fetch_all(conn, "SELECT * FROM demands ORDER BY required_date, id")
     for row in calendar:
-        row["available_capacity"] = max(0.0, float(row["daily_capacity"]) - float(row["planned_production"]))
+        committed = float(row.get("committed_production") or 0.0)
+        row["committed_production"] = committed
+        row["available_capacity"] = max(0.0, float(row["daily_capacity"]) - float(row["planned_production"]) - committed)
     _clear_unstockable(products, inventory)
-    return {
+    world = {
         "plants": plants,
         "products": products,
         "calendar": calendar,
@@ -97,6 +128,22 @@ def load_world() -> dict:
         "demands": demands,
         "scenario_notes": [],
     }
+    from app.operations import apply_open_commitments
+
+    apply_open_commitments(world)
+    return world
+
+
+def _plant_mode(plant_id: int) -> str:
+    from app.operations import plant_mode
+
+    return plant_mode(plant_id)
+
+
+def _open_decision(plant_id: int, product_id: int):
+    from app.operations import open_decision_view
+
+    return open_decision_view(plant_id, product_id)
 
 
 def _plant(world: dict, plant_id: int) -> dict:
@@ -573,9 +620,11 @@ def _policy_sort(demand: dict, policy: str):
 def _greedy(demands: list[dict], days: list[str], cap: dict[str, float], usable: float, policy: str) -> dict[int, dict]:
     remaining_cap = dict(cap)
     remaining_inv = usable
+    buffer = _buffer_days()
 
     plan: dict[int, dict] = {}
     for demand in sorted(demands, key=lambda row: _policy_sort(row, policy)):
+        deadline = _schedule_deadline(str(demand["required_date"]), penalty_type_of(demand), buffer)
         need = float(demand["quantity"])
         from_inv = min(need, remaining_inv)
         remaining_inv -= from_inv
@@ -583,7 +632,7 @@ def _greedy(demands: list[dict], days: list[str], cap: dict[str, float], usable:
         from_prod = 0.0
         by_day = []
         for day in reversed(days):
-            if day > demand["required_date"] or need <= TOL:
+            if day > deadline or need <= TOL:
                 continue
             take = min(need, remaining_cap[day])
             if take <= TOL:
@@ -632,6 +681,7 @@ def _parent_greedy(parents: list[dict], days: list[str], cap: dict[str, float], 
     """Fill whole orders. Dates limit production. Complete-or-skip refuses a lump-sum it cannot finish."""
     remaining_cap = dict(cap)
     remaining_inv = usable
+    buffer = _buffer_days()
     if policy == "unit_expected":
         ordered = sorted(parents, key=lambda row: (-float(row["unit_expected_rm"]), row["required_date"], int(row["id"])))
     elif policy == "earliest":
@@ -643,8 +693,9 @@ def _parent_greedy(parents: list[dict], days: list[str], cap: dict[str, float], 
         requested = float(demand["quantity"])
         confirmed = min(max(float(demand.get("confirmed_quantity") or 0.0), 0.0), requested)
         skip = False
+        deadline = _schedule_deadline(str(demand["required_date"]), penalty_type_of(demand), buffer)
         if policy == "complete_or_skip" and penalty_type_of(demand) == "lump_sum" and confirmed > TOL:
-            if _supply_by_date(days, remaining_cap, remaining_inv, str(demand["required_date"])) + TOL < confirmed:
+            if _supply_by_date(days, remaining_cap, remaining_inv, deadline) + TOL < confirmed:
                 skip = True
         if skip:
             plan[int(demand["id"])] = {
@@ -655,7 +706,7 @@ def _parent_greedy(parents: list[dict], days: list[str], cap: dict[str, float], 
                 "by_day": [],
             }
             continue
-        allocated, remaining_inv, from_prod, by_day = _draw(days, remaining_cap, remaining_inv, str(demand["required_date"]), requested)
+        allocated, remaining_inv, from_prod, by_day = _draw(days, remaining_cap, remaining_inv, deadline, requested)
         allocated = _snap(allocated, requested)
         plan[int(demand["id"])] = {
             "allocated": allocated,
@@ -1253,7 +1304,11 @@ def solve_bucket(
     ]
     inventory = next(row for row in world["inventory"] if row["plant_id"] == plant_id and row["product_id"] == product_id)
     usable = float(inventory["usable"])
-    raw_demands = [row for row in world["demands"] if row["plant_id"] == plant_id and row["product_id"] == product_id]
+    raw_demands = [
+        row
+        for row in world["demands"]
+        if row["plant_id"] == plant_id and row["product_id"] == product_id and float(row["requested_quantity"]) > TOL
+    ]
     demands = _prepare_demands(raw_demands)
     emergency = float(product["emergency_cost_per_m3"])
     assumption = bool(product["emergency_cost_is_assumption"])
@@ -1539,6 +1594,8 @@ def solve_bucket(
         "objective_epsilon_rm": OBJECTIVE_EPSILON_RM,
         "expedite_proposal": expedite_proposal,
         "recommendation_basis": recommendation_basis,
+        "plant_mode": _plant_mode(plant_id),
+        "open_decision": _open_decision(plant_id, product_id),
         "comparison": comparison,
         "unverified_minimax": minimax,
         "party_burden": party,
@@ -2073,9 +2130,14 @@ def feasibility(world: dict, plant_id: int, product_id: int, targets: dict[int, 
                 "message": f"{by_id[demand_id]['customer_or_project']} cannot be allocated {_m3(allocated)}. Requested quantity is {_m3(qty)}.",
             }
     cumulative_capacity = 0.0
+    buffer = _buffer_days()
     for day in days:
         cumulative_capacity += cap[day]
-        must = sum(float(targets.get(int(row["id"]), 0.0)) for row in demands if row["required_date"] <= day)
+        must = sum(
+            float(targets.get(int(row["id"]), 0.0))
+            for row in demands
+            if _schedule_deadline(str(row["required_date"]), penalty_type_of(row), buffer) <= day
+        )
         have = usable + cumulative_capacity
         if must > have + 0.2:
             return {
@@ -2133,6 +2195,7 @@ def capacity_view(plant_id: int, product_id: int) -> dict:
                 "date": row["prod_date"],
                 "daily_capacity_m3": row["daily_capacity"],
                 "planned_production_m3": row["planned_production"],
+                "committed_production_m3": round_m3(float(row.get("committed_production") or 0.0)),
                 "available_capacity_m3": row["available_capacity"],
                 "internal_demand_due_m3": round_m3(internal),
                 "external_demand_due_m3": round_m3(external),
