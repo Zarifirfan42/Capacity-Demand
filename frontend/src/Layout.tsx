@@ -13,11 +13,28 @@ const LINKS: readonly (readonly [string, string, string])[] = [
   ["/measurement", "07", "Measurement"],
 ];
 
+const ROLE_LABELS: Record<string, string> = {
+  viewer: "Viewer",
+  scheduler: "Scheduler",
+  plant_supervisor: "Plant supervisor",
+  project_planner: "Project planner",
+  commercial_owner: "Commercial owner",
+  admin: "Admin",
+};
+
 export function Layout() {
   const { name, setName, role, setRole, passcode, setPasscode } = usePlanner();
-  const [hint, setHint] = useState<string | null>(null);
+  const [hints, setHints] = useState<Record<string, string>>({});
+  const [roles, setRoles] = useState<string[]>(["viewer", "scheduler", "plant_supervisor", "project_planner", "commercial_owner", "admin"]);
+  const [identity, setIdentity] = useState("");
   useEffect(() => {
-    api<{ planner_hint: string | null }>("/api/auth-status").then((row) => setHint(row.planner_hint)).catch(() => undefined);
+    api<{ hints: Record<string, string>; roles: string[]; identity_note: string }>("/api/auth-status")
+      .then((row) => {
+        setHints(row.hints || {});
+        setRoles(row.roles);
+        setIdentity(row.identity_note);
+      })
+      .catch(() => undefined);
   }, []);
   return (
     <div className="shell">
@@ -39,13 +56,12 @@ export function Layout() {
           <input id="planner" value={name} onChange={(event) => setName(event.target.value)} />
           <label htmlFor="role">Role</label>
           <select id="role" value={role} onChange={(event) => setRole(event.target.value)}>
-            <option value="viewer">Viewer</option>
-            <option value="planner">Planner</option>
-            <option value="admin">Admin</option>
+            {roles.map((item) => <option key={item} value={item}>{ROLE_LABELS[item] || item}</option>)}
           </select>
-          <label htmlFor="passcode">Passcode for writes</label>
+          <label htmlFor="passcode">Passcode for this role</label>
           <input id="passcode" type="password" value={passcode} onChange={(event) => setPasscode(event.target.value)} />
-          {hint ? <p className="note">Local demo planner passcode: {hint}. The admin passcode is set on the server and is not shown here.</p> : null}
+          {hints[role] ? <p className="note">Local demo passcode for this role: {hints[role]}. A configured server secret is not shown.</p> : null}
+          {identity ? <p className="note">{identity}</p> : null}
         </div>
       </aside>
       <main className="main">

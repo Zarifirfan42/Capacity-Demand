@@ -24,6 +24,21 @@ type Measurement = {
       realised: { definition: string; overridden: Range; accepted: Range; quote_difference: boolean; note: string };
     };
   };
+  governance?: {
+    signoffs_n: number;
+    signoffs_per_week: number;
+    median_hours_to_sign: number | null;
+    acceptance_rate: number | null;
+    acceptance_n: number;
+    rubber_stamp_warning: boolean;
+    rubber_stamp_note: string;
+    defaulted_n: number;
+    awaiting_n: number;
+    non_response_by_role: Record<string, number>;
+    constraints_n: number;
+    constraints_bound_n: number;
+    constraints_checked_n: number;
+  };
   illustration: {
     watermark: string;
     missing?: boolean;
@@ -43,6 +58,8 @@ export function MeasurementPage() {
   const [products, setProducts] = useState<{ id: number; code: string; name: string }[]>([]);
   const [stock, setStock] = useState({ plantId: 1, productId: 3, date: "2026-10-08", onHand: 0, safety: 0 });
   const [tick, setTick] = useState(0);
+  const [declared, setDeclared] = useState({ demandId: 1, rate: 0, source: "programme float report", reason: "" });
+  const [proposal, setProposal] = useState({ key: "review_programme_days", value: "2", reason: "" });
 
   useEffect(() => {
     api<Measurement>("/api/measurement").then(setData).catch((err: Error) => setError(err.message));
@@ -124,6 +141,38 @@ export function MeasurementPage() {
         <p>Ex-ante n = {live.override_learning.ex_ante.n}{live.override_learning.ex_ante.n > 0 ? `, range ${rm(live.override_learning.ex_ante.min_rm || 0)} to ${rm(live.override_learning.ex_ante.max_rm || 0)}` : ""}. {live.override_learning.ex_ante.quote_mean ? "" : "Mean is not quoted below 8 overrides."}</p>
         <p>{live.override_learning.realised.note}</p>
         <p>Overridden n = {live.override_learning.realised.overridden.n}. Accepted n = {live.override_learning.realised.accepted.n}.</p>
+      </Panel>
+      <Panel title="Review load" sub="Always shown with n. Acceptance near 100% and a median under a minute, once n is at least 8, is a rubber-stamp warning.">
+        {data.governance ? (
+          <>
+            <p>Sign-offs n = {data.governance.signoffs_n}. This week’s count is the same n until more than one week is stored: {data.governance.signoffs_per_week}. Median hours to sign: {data.governance.median_hours_to_sign == null ? "—" : data.governance.median_hours_to_sign}. Acceptance rate {data.governance.acceptance_rate == null ? "—" : data.governance.acceptance_rate} on n = {data.governance.acceptance_n}.</p>
+            <p>Awaiting n = {data.governance.awaiting_n}. Defaulted n = {data.governance.defaulted_n}. Non-response by role: {Object.keys(data.governance.non_response_by_role).length === 0 ? "none" : Object.entries(data.governance.non_response_by_role).map(([role, count]) => `${role} ${count}`).join(", ")}.</p>
+            <p>Constraints n = {data.governance.constraints_n}. Bound {data.governance.constraints_bound_n} of {data.governance.constraints_checked_n} checked after actuals.</p>
+            {data.governance.rubber_stamp_warning ? <p>{data.governance.rubber_stamp_note}</p> : null}
+          </>
+        ) : <p>n = 0.</p>}
+        <div className="field"><label>Internal order id</label><input type="number" min={1} value={declared.demandId} onChange={(event) => setDeclared({ ...declared, demandId: Number(event.target.value) })} /></div>
+        <div className="field"><label>Declared RM per day</label><input type="number" min={0} value={declared.rate} onChange={(event) => setDeclared({ ...declared, rate: Number(event.target.value) })} /></div>
+        <div className="field"><label>Source</label>
+          <select value={declared.source} onChange={(event) => setDeclared({ ...declared, source: event.target.value })}>
+            <option>client LD clause</option>
+            <option>holding cost</option>
+            <option>programme float report</option>
+          </select>
+        </div>
+        <div className="field grow"><label>Reason</label><textarea value={declared.reason} onChange={(event) => setDeclared({ ...declared, reason: event.target.value })} /></div>
+        <button className="btn" onClick={() => void api("/api/delay-declarations", { method: "POST", body: JSON.stringify({ username: name || "Planner", demand_id: declared.demandId, declared_rm_per_day: declared.rate, source: declared.source, reason: declared.reason }) }).then(() => setTick((value) => value + 1)).catch((err: Error) => setError(err.message))}>Declare delay cost</button>
+        <div className="field"><label>Threshold</label>
+          <select value={proposal.key} onChange={(event) => setProposal({ ...proposal, key: event.target.value })}>
+            <option value="review_programme_days">Programme days</option>
+            <option value="review_expected_rm">Expected consequence RM</option>
+            <option value="review_penalty_rm">Penalty RM</option>
+            <option value="expedite_limit_rm">Expedite limit RM</option>
+          </select>
+          <input value={proposal.value} onChange={(event) => setProposal({ ...proposal, value: event.target.value })} />
+        </div>
+        <div className="field grow"><label>Why this proposal</label><textarea value={proposal.reason} onChange={(event) => setProposal({ ...proposal, reason: event.target.value })} /></div>
+        <button className="btn" onClick={() => void api("/api/settings/proposals", { method: "POST", body: JSON.stringify({ username: name || "Planner", key: proposal.key, proposed_value: proposal.value, reason: proposal.reason }) }).then(() => setTick((value) => value + 1)).catch((err: Error) => setError(err.message))}>Propose a threshold for the next cycle</button>
       </Panel>
       <Panel title="Expedite records" sub="Estimated avoided is counterfactual. The page shows counts.">
         <p>n = {live.expedite.n}. Approved {live.expedite.approved}. Declined {live.expedite.declined}. {live.expedite.label}: {rm(live.expedite.estimated_avoided_rm)}.</p>

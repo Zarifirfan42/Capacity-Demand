@@ -23,7 +23,7 @@ type Fragility = {
 };
 
 export function AllocationPage() {
-  const { name } = usePlanner();
+  const { name, role } = usePlanner();
   const [params, setParams] = useSearchParams();
   const [result, setResult] = useState<AllocationResult | null>(null);
   const [decisions, setDecisions] = useState<DecisionRow[]>([]);
@@ -47,6 +47,13 @@ export function AllocationPage() {
   const [pairedNote, setPairedNote] = useState("");
   const [expediteOrder, setExpediteOrder] = useState("");
   const [expediteDraft, setExpediteDraft] = useState({ rate: 0, volume: 0, would: 0, paid: 0, full: false, onTime: false, decision: "approve" });
+  const [signChoice, setSignChoice] = useState<"recommended" | "proposed">("recommended");
+  const [signReason, setSignReason] = useState("");
+  const [constraintKind, setConstraintKind] = useState<"cap" | "reserve" | "days">("cap");
+  const [constraintQty, setConstraintQty] = useState(10);
+  const [constraintEvidence, setConstraintEvidence] = useState("site diary");
+  const [constraintDemand, setConstraintDemand] = useState(0);
+  const [consultNote, setConsultNote] = useState("");
 
   function refreshDecisions() {
     api<{ rows: DecisionRow[] }>("/api/decisions").then((payload) => setDecisions(payload.rows)).catch(() => undefined);
@@ -192,8 +199,15 @@ export function AllocationPage() {
           })),
         }),
       });
-      setSaved(response.status === "modified" ? "Modified allocation recorded." : "Recommendation approved and recorded.");
+      setSaved(
+        response.status === "awaiting_signoff"
+          ? "Waiting for the owners of the orders whose allocation changed or is unserved."
+          : response.status === "modified"
+            ? "Modified allocation recorded."
+            : "Recommendation approved and recorded.",
+      );
       refreshDecisions();
+      setReveal((value) => value + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not record the decision.");
     }
@@ -524,7 +538,7 @@ export function AllocationPage() {
                 <tr key={line.demand_id} className={line.unserved_quantity > 0 ? "constrained" : ""}>
                   <td>
                     <strong>{line.customer_or_project}</strong>
-                    <div className="note">{line.demand_code} · {line.demand_type} · {line.confidence_level} · {line.project_criticality}</div>
+                    <div className="note">{line.demand_code} · {line.demand_type} · {line.confidence_level} · {line.project_criticality}{line.owner_name ? ` · owner ${line.owner_name}` : ""}</div>
                   </td>
                   <td className="nowrap">{longDate(line.required_date)}</td>
                   <td className="num">{rm(line.unit_expected_rm)}</td>
@@ -565,18 +579,22 @@ export function AllocationPage() {
             Projected stock: opening {m3(bucket.inventory_projection.opening_on_hand_m3)}, drawn {m3(bucket.inventory_projection.drawn_from_inventory_m3)}, produced for this allocation {m3(bucket.inventory_projection.produced_for_allocation_m3)}, closing on-hand {m3(bucket.inventory_projection.projected_closing_on_hand_m3)}. {bucket.inventory_projection.basis}
           </p>
         ) : null}
-        <div className="field">
-          <label>If you change the recommendation, why?</label>
-          <select value={category} onChange={(event) => setCategory(event.target.value)}>
-            {["Customer commitment", "Project criticality", "Contractual obligation", "Operational constraint", "Management decision", "Data issue", "Other"].map((item) => (
-              <option key={item}>{item}</option>
-            ))}
-          </select>
-        </div>
-        <div className="field grow">
-          <label>Reason for the decision</label>
-          <textarea value={reason} onChange={(event) => setReason(event.target.value)} />
-        </div>
+        {preview?.changed_from_recommendation ? (
+          <>
+            <div className="field">
+              <label>If you change the recommendation, why?</label>
+              <select value={category} onChange={(event) => setCategory(event.target.value)}>
+                {["Customer commitment", "Project criticality", "Contractual obligation", "Operational constraint", "Management decision", "Data issue", "Other"].map((item) => (
+                  <option key={item}>{item}</option>
+                ))}
+              </select>
+            </div>
+            <div className="field grow">
+              <label>Reason for the change</label>
+              <textarea value={reason} onChange={(event) => setReason(event.target.value)} />
+            </div>
+          </>
+        ) : <p className="note">This matches the recommendation, so the recorded reason is “Accepted as recommended”.</p>}
         {termLines.length > 0 ? (
           <label className="check">
             <input type="checkbox" checked={termsConfirmed} onChange={(event) => setTermsConfirmed(event.target.checked)} />
@@ -588,7 +606,56 @@ export function AllocationPage() {
         </button>
       </Panel>
 
-      {bucket.open_decision && !bucket.open_decision.locked ? (
+      {bucket.open_decision?.status === "awaiting_signoff" ? (
+        <Panel title="Sign-off" sub="The required names are the owners of orders whose allocation changed or is unserved. The plant supervisor can leave a note and does not veto.">
+          <p>Deadline {bucket.open_decision.deadline ? when(bucket.open_decision.deadline) : "—"}. A soft hold is on the proposed capacity until this closes.</p>
+          <ul>
+            {(bucket.open_decision.required_signatories || []).map((row) => (
+              <li key={`${row.role}-${row.username}`}>{row.username} · {row.role}{(row.orders || []).length ? ` · ${(row.orders || []).join(", ")}` : ""}</li>
+            ))}
+          </ul>
+          <div className="field">
+            <label>Plan you are signing</label>
+            <select value={signChoice} onChange={(event) => setSignChoice(event.target.value as "recommended" | "proposed")}>
+              <option value="recommended">Recommendation</option>
+              <option value="proposed">Proposed allocation</option>
+            </select>
+          </div>
+          <div className="field grow">
+            <label>Why you sign</label>
+            <textarea value={signReason} onChange={(event) => setSignReason(event.target.value)} />
+          </div>
+          <button className="btn" onClick={() => void api(`/api/decisions/${bucket.open_decision?.id}/signoff`, { method: "POST", body: JSON.stringify({ username: name, plan_choice: signChoice, reason: signReason }) }).then(() => setReveal((value) => value + 1)).catch((err: Error) => setError(err.message))}>Sign as {name || "owner"}</button>
+          <div className="field">
+            <label>Constraint instead of a veto</label>
+            <select value={constraintKind} onChange={(event) => setConstraintKind(event.target.value as "cap" | "reserve" | "days")}>
+              <option value="cap">Cap m³</option>
+              <option value="reserve">Reserve m³</option>
+              <option value="days">Days limit</option>
+            </select>
+            <input type="number" min={1} value={constraintQty} onChange={(event) => setConstraintQty(Number(event.target.value))} />
+            <select value={constraintEvidence} onChange={(event) => setConstraintEvidence(event.target.value)}>
+              <option>site diary</option>
+              <option>crew roster</option>
+              <option>access permit</option>
+            </select>
+            <select value={constraintDemand} onChange={(event) => setConstraintDemand(Number(event.target.value))}>
+              <option value={0}>Order</option>
+              {bucket.allocations.map((line) => <option key={line.demand_id} value={line.demand_id}>{line.customer_or_project}</option>)}
+            </select>
+          </div>
+          <button className="btn" onClick={() => void api(`/api/decisions/${bucket.open_decision?.id}/constraints`, { method: "POST", body: JSON.stringify({ username: name, kind: constraintKind, quantity: constraintQty, evidence_type: constraintEvidence, demand_id: constraintDemand || null, note: signReason || "Recorded from the evidence named above." }) }).then((row: { label?: string }) => { setSaved(row.label || "Constraint applied."); setReveal((value) => value + 1); }).catch((err: Error) => setError(err.message))}>Apply constraint and re-solve</button>
+          {role === "plant_supervisor" ? (
+            <div className="field grow">
+              <label>Plant supervisor note</label>
+              <textarea value={consultNote} onChange={(event) => setConsultNote(event.target.value)} />
+              <button className="btn" onClick={() => void api(`/api/decisions/${bucket.open_decision?.id}/consultation`, { method: "POST", body: JSON.stringify({ username: name, note: consultNote }) }).then(() => setSaved("Consultation noted.")).catch((err: Error) => setError(err.message))}>Record consultation</button>
+            </div>
+          ) : null}
+        </Panel>
+      ) : null}
+
+      {bucket.open_decision && !bucket.open_decision.locked && bucket.open_decision.status !== "awaiting_signoff" ? (
         <Panel title="Record actuals" sub="Delivered quantity may sit up to 5% above requested. Saving actuals locks this decision.">
           {bucket.allocations.map((line) => (
             <div className="field" key={line.demand_id}>

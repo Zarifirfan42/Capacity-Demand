@@ -10,6 +10,7 @@ type Series = {
   daily_capacity_m3: number;
   planned_production_m3: number;
   committed_production_m3?: number;
+  held_production_m3?: number;
   available_capacity_m3: number;
   internal_demand_due_m3: number;
   external_demand_due_m3: number;
@@ -130,6 +131,7 @@ export function CapacityPage() {
                       <th className="num">Capacity</th>
                       <th className="num">Planned</th>
                       <th className="num">Committed</th>
+                      <th className="num">Held</th>
                       <th className="num">Available</th>
                       <th className="num">Demand due</th>
                       <th className="num">Cumulative gap</th>
@@ -142,6 +144,7 @@ export function CapacityPage() {
                         <td className="num">{m3(row.daily_capacity_m3)}</td>
                         <td className="num">{m3(row.planned_production_m3)}</td>
                         <td className="num">{m3(row.committed_production_m3 || 0)}</td>
+                        <td className="num">{m3(row.held_production_m3 || 0)}</td>
                         <td className="num">{m3(row.available_capacity_m3)}</td>
                         <td className="num">{m3(row.internal_demand_due_m3 + row.external_demand_due_m3)}</td>
                         <td className="num">{row.cumulative_gap_m3 > 0 ? m3(row.cumulative_gap_m3) : "—"}</td>

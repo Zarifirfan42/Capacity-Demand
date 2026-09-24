@@ -18,7 +18,10 @@ const PlannerContext = createContext<{
 
 export function PlannerProvider({ children }: { children: ReactNode }) {
   const [name, setNameState] = useState(() => localStorage.getItem("cdi-planner") || "A. Rahman");
-  const [role, setRoleState] = useState(() => sessionStorage.getItem("cdi-role") || "viewer");
+  const [role, setRoleState] = useState(() => {
+    const stored = sessionStorage.getItem("cdi-role") || "viewer";
+    return stored === "planner" ? "scheduler" : stored;
+  });
   const [passcode, setPasscodeState] = useState(() => sessionStorage.getItem("cdi-passcode") || "");
   const setName = (value: string) => {
     setNameState(value);

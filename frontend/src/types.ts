@@ -72,6 +72,8 @@ export type AllocationLine = {
   demand_code: string;
   demand_type: string;
   customer_or_project: string;
+  owner_name?: string;
+  owner_role?: string;
   customer_type: string;
   required_date: string;
   requested_quantity: number;
@@ -203,6 +205,8 @@ export type Bucket = {
     username: string;
     created_at: string;
     status: string;
+    deadline?: string | null;
+    required_signatories?: { username: string; role: string; orders?: string[] }[];
     locked: boolean;
     lines: { demand_id: number; customer_or_project: string; committed_m3: number; recommended_m3: number }[];
   } | null;
