@@ -143,6 +143,32 @@ export function ImpactPage() {
         <p className="note">{band.gap_nonnegative_note}</p>
         <p className="note">Practice-proxy footnote: {rm(data.upper_bound.gap_rm)}. {data.upper_bound.detail}</p>
       </Panel>
+      {data.best_rule_by_bucket && data.best_rule_by_bucket.length > 0 ? (
+        <Panel title="Winning simple rule by plant and product" sub="The headline is the sum of these gaps. Each bucket uses whichever rule scores lowest under the seeded terms.">
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Plant</th>
+                  <th>Product</th>
+                  <th>Winner</th>
+                  <th className="num">Gap</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.best_rule_by_bucket.map((row) => (
+                  <tr key={`${row.plant_name}-${row.product_name}`}>
+                    <td>{row.plant_name}</td>
+                    <td>{row.product_name}</td>
+                    <td>{row.best_rule_label}</td>
+                    <td className="num">{rm(row.gap_rm)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      ) : null}
       {data.verify_contracts ? (
         <Panel title="Verify these contracts first" sub={data.verify_contracts.note}>
           <p className="note">{data.verify_contracts.order_count_note} {data.verify_contracts.order_count} lines.</p>
@@ -152,18 +178,18 @@ export function ImpactPage() {
                 <tr>
                   <th>Order</th>
                   <th>Flipped to</th>
-                  <th className="num">Gap change</th>
                   <th className="num">m³ moved</th>
+                  <th className="num">Gap change</th>
                   <th>Allocation</th>
                 </tr>
               </thead>
               <tbody>
-                {data.verify_contracts.lines.slice(0, 8).map((row) => (
+                {data.verify_contracts.lines.map((row) => (
                   <tr key={row.demand_code}>
                     <td>{row.customer_or_project}</td>
                     <td>{row.to_penalty_type} / {row.to_delay_type}</td>
-                    <td className="num">{rm(row.gap_change_rm)}</td>
                     <td className="num">{m3(row.m3_moved)}</td>
+                    <td className="num">{rm(row.gap_change_rm)}</td>
                     <td>{row.allocation_changed ? row.statement : "Score only"}</td>
                   </tr>
                 ))}
@@ -245,7 +271,7 @@ export function ImpactPage() {
         </div>
       </Panel>
 
-      <Panel title="What a blanket preference would cost" sub="Shown so the absence of an internal or external rule is visible.">
+      <Panel title="What a blanket preference would cost" sub="Internal-first and external-first are in the best-of set. This table is the cost of applying one of them to every plant and product.">
         <div className="table-wrap">
           <table>
             <thead>

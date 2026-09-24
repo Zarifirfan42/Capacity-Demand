@@ -581,20 +581,24 @@ def _greedy(demands: list[dict], days: list[str], cap: dict[str, float], usable:
         remaining_inv -= from_inv
         need -= from_inv
         from_prod = 0.0
-        for day in days:
+        by_day = []
+        for day in reversed(days):
             if day > demand["required_date"] or need <= TOL:
-                break
+                continue
             take = min(need, remaining_cap[day])
+            if take <= TOL:
+                continue
             remaining_cap[day] -= take
             need -= take
             from_prod += take
+            by_day.append({"date": day, "quantity": round_m3(take)})
         allocated = _snap(float(demand["quantity"]) - max(need, 0.0), float(demand["quantity"]))
         plan[int(demand["id"])] = {
             "allocated": allocated,
             "unserved": round_m3(float(demand["quantity"]) - allocated),
             "from_inventory": round_m3(from_inv),
             "from_production": round_m3(from_prod),
-            "by_day": [],
+            "by_day": by_day,
         }
     return plan
 
@@ -603,21 +607,25 @@ def _supply_by_date(days: list[str], cap: dict[str, float], inventory: float, re
     return float(inventory) + sum(float(cap[day]) for day in days if day <= required_date)
 
 
-def _draw(days: list[str], cap: dict[str, float], inventory: float, required_date: str, qty: float) -> tuple[float, float, float]:
-    """Take up to qty from inventory then dated capacity. Returns allocated, inventory left, and production taken."""
+def _draw(days: list[str], cap: dict[str, float], inventory: float, required_date: str, qty: float) -> tuple[float, float, float, list[dict]]:
+    """Take up to qty from inventory, then from the latest feasible production day."""
     need = float(qty)
     from_inv = min(need, inventory)
     inventory -= from_inv
     need -= from_inv
     from_prod = 0.0
-    for day in days:
+    by_day: list[dict] = []
+    for day in reversed(days):
         if day > required_date or need <= TOL:
-            break
+            continue
         take = min(need, cap[day])
+        if take <= TOL:
+            continue
         cap[day] -= take
         need -= take
         from_prod += take
-    return float(qty) - max(need, 0.0), inventory, from_prod
+        by_day.append({"date": day, "quantity": round_m3(take)})
+    return float(qty) - max(need, 0.0), inventory, from_prod, by_day
 
 
 def _parent_greedy(parents: list[dict], days: list[str], cap: dict[str, float], usable: float, policy: str) -> dict[int, dict]:
@@ -647,14 +655,14 @@ def _parent_greedy(parents: list[dict], days: list[str], cap: dict[str, float], 
                 "by_day": [],
             }
             continue
-        allocated, remaining_inv, from_prod = _draw(days, remaining_cap, remaining_inv, str(demand["required_date"]), requested)
+        allocated, remaining_inv, from_prod, by_day = _draw(days, remaining_cap, remaining_inv, str(demand["required_date"]), requested)
         allocated = _snap(allocated, requested)
         plan[int(demand["id"])] = {
             "allocated": allocated,
             "unserved": round_m3(requested - allocated),
             "from_inventory": round_m3(allocated - from_prod) if allocated + TOL >= from_prod else round_m3(allocated),
             "from_production": round_m3(min(from_prod, allocated)),
-            "by_day": [],
+            "by_day": by_day,
         }
     return plan
 
@@ -1860,7 +1868,8 @@ def _greedy_bundles(bundles: list[dict], policy: str, shared: bool) -> dict[int,
         remaining_inv[product_id] -= from_inv
         need -= from_inv
         from_prod = 0.0
-        for day in days:
+        by_day = []
+        for day in reversed(days):
             if day > demand["required_date"] or need <= TOL:
                 continue
             product_left = remaining_cap.get((product_id, day), 0.0)
@@ -1873,6 +1882,7 @@ def _greedy_bundles(bundles: list[dict], policy: str, shared: bool) -> dict[int,
                 remaining_shared[day] -= take
             need -= take
             from_prod += take
+            by_day.append({"date": day, "quantity": round_m3(take)})
         qty = float(demand["quantity"])
         allocated = _snap(qty - max(need, 0.0), qty)
         plan[int(demand["id"])] = {
@@ -1880,7 +1890,7 @@ def _greedy_bundles(bundles: list[dict], policy: str, shared: bool) -> dict[int,
             "unserved": round_m3(qty - allocated),
             "from_inventory": round_m3(from_inv),
             "from_production": round_m3(from_prod),
-            "by_day": [],
+            "by_day": by_day,
         }
     return plan
 
@@ -2228,8 +2238,9 @@ def value_protected_band(base: dict | None = None) -> dict:
         ),
         "formula": (
             "Modelled gap = expected consequence of the best simple rule minus the recommended allocation. "
-            "The simple rules are earliest required date, penalty and delay per cubic metre, complete-or-skip for lump-sum orders, "
-            "and a greedy rank by unit expected consequence. Each plant-product uses whichever scores lowest. "
+            "The simple rules are internal-first, external-first, earliest required date, penalty and delay per cubic metre, "
+            "complete-or-skip for lump-sum orders, and a greedy rank by unit expected consequence. "
+            "Each rule places production on the latest feasible day. Each plant-product uses whichever scores lowest. "
             "The range re-solves that gap with every term linear, with the seeded mix, and with every positive term as a lump. "
             "This is a modelled difference on synthetic orders, not observed savings."
         ),
@@ -2291,14 +2302,15 @@ def value_of_information(base: dict | None = None) -> dict:
                 ),
             }
         )
-    rows.sort(key=lambda row: (-abs(float(row["gap_change_rm"])), -float(row["m3_moved"]), row["demand_code"]))
+    rows.sort(key=lambda row: (-float(row["m3_moved"]), -abs(float(row["gap_change_rm"])), row["demand_code"]))
     payload = {
         "order_count": len(rows),
         "order_count_note": "One row per demand line. The book has 18 lines. Tranches are not separate orders.",
         "lines": rows,
         "note": (
             "Each line is re-solved on its own plant and product with that order's penalty type and delay type flipped. "
-            "The recommendation and the best simple rule are both solved again. Other plant-products stay on the base solve."
+            "The recommendation and the best simple rule are both solved again. Other plant-products stay on the base solve. "
+            "The list is ranked by cubic metres moved, then by the change in the headline gap."
         ),
     }
     _VOI_CACHE = payload

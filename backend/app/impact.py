@@ -206,7 +206,7 @@ def build_impact() -> dict:
         "pilot_name": "Optimised — minimise business consequence",
         "approved_name": "Approved — human decision where recorded",
         "columns": [
-            {"key": "best", "label": "Best simple rule", "detail": "Lowest of earliest-date, penalty and delay per m³, complete-or-skip, and greedy unit expected, chosen per plant-product.", **best},
+            {"key": "best", "label": "Best simple rule", "detail": "Lowest of internal-first, external-first, earliest-date, penalty and delay per m³, complete-or-skip, and greedy unit expected. Each rule places production on the latest feasible day. Chosen per plant-product.", **best},
             {"key": "earliest", "label": "Earliest required date", "detail": "Second comparison on the same demand and capacity. A named rule, not a record of what the plant did.", **earliest},
             {"key": "pilot", "label": "Optimised", "detail": "Mixed-integer programme under each order's penalty and delay type.", **pilot},
             {"key": "approved", "label": "Approved plan", "detail": "Latest human decision on each plant and product, otherwise the recommendation.", **approved},

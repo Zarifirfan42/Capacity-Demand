@@ -333,7 +333,7 @@ export function AllocationPage() {
                       onChange={(event) => setEdits({ ...edits, [line.demand_id]: Number(event.target.value) })}
                     />
                   </td>
-                  <td className="reason">{line.why_not || line.reason}{line.tranche_note ? <div className="note">{line.tranche_note}</div> : null}</td>
+                  <td className="reason">{line.why_not || line.reason}{line.partial_service_no_penalty_avoided ? <div className="note">Partial service, no penalty avoided. The cubic metres served leave the penalty and delay unchanged versus missing the order. They earn margin only.</div> : null}{line.tranche_note ? <div className="note">{line.tranche_note}</div> : null}</td>
                 </tr>
               ))}
             </tbody>

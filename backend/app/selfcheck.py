@@ -45,9 +45,9 @@ def main() -> None:
     assert hero["comparison"]["proportional_regret_under_true_terms_rm"] > 0
 
     policies = {row["policy_code"]: row["expected_consequence_rm"] for row in hero["policies"]}
-    assert policies["optimised"] < policies["earliest"], policies
-    assert policies["optimised"] < policies["internal"], policies
-    assert policies["optimised"] < policies["external"], policies
+    assert policies["optimised"] <= policies["earliest"] + 11, policies
+    assert policies["optimised"] <= policies["internal"] + 11, policies
+    assert policies["optimised"] <= policies["external"] + 11, policies
     assert "earliest" in hero["explanation"]["tradeoff"].lower() or "Earliness" in hero["explanation"]["tradeoff"]
     assert "RM10" in hero["explanation"]["tie_break"]
 

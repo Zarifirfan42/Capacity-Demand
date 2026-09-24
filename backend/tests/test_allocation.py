@@ -354,7 +354,7 @@ def test_recommendation_beats_simple_rules_and_capacity_is_monotone() -> None:
                 continue
             assert recommended <= policy["expected_consequence_rm"] + OBJECTIVE_EPSILON_RM + 1
         assert bucket["headline_gap"]["true_rm"] >= -0.05
-        assert bucket["headline_gap"]["best_rule"] in {"earliest", "penalty_delay", "complete_or_skip", "unit_expected"}
+        assert bucket["headline_gap"]["best_rule"] in {"internal", "external", "earliest", "penalty_delay", "complete_or_skip", "unit_expected"}
     plant_id, product_id = _sa_g40_ids()
     world = load_world()
     base = solve_bucket(world, plant_id, product_id, include_comparison=False, include_expedite=False)
@@ -366,6 +366,53 @@ def test_recommendation_beats_simple_rules_and_capacity_is_monotone() -> None:
         include_expedite=False,
     )
     assert bigger["expected_consequence_rm"] <= base["expected_consequence_rm"] + 1
+
+
+def test_heuristics_leave_no_idle_supply_that_could_finish_a_skipped_order() -> None:
+    from app.economics import penalty_type_of
+    from app.engine import _collapse_plan, _expanded, _greedy, _parent_greedy, _supply_by_date
+
+    world = load_world()
+    for plant in world["plants"]:
+        for product in world["products"]:
+            raw = [row for row in world["demands"] if row["plant_id"] == plant["id"] and row["product_id"] == product["id"]]
+            if not raw:
+                continue
+            days = sorted(
+                row["prod_date"]
+                for row in world["calendar"]
+                if row["plant_id"] == plant["id"] and row["product_id"] == product["id"]
+            )
+            cap = {
+                row["prod_date"]: float(row["available_capacity"])
+                for row in world["calendar"]
+                if row["plant_id"] == plant["id"] and row["product_id"] == product["id"]
+            }
+            usable = float(next(row["usable"] for row in world["inventory"] if row["plant_id"] == plant["id"] and row["product_id"] == product["id"]))
+            parents, tranches = _expanded(raw)
+            plans = {name: _collapse_plan(parents, tranches, _greedy(tranches, days, cap, usable, name)) for name in ("internal", "external", "earliest", "practice")}
+            for name in ("penalty_delay", "complete_or_skip", "unit_expected"):
+                plans[name] = _parent_greedy(parents, days, cap, usable, name)
+            for name, plan in plans.items():
+                used = {day: 0.0 for day in days}
+                inventory_used = 0.0
+                for slot in plan.values():
+                    inventory_used += float(slot.get("from_inventory") or 0.0)
+                    for item in slot.get("by_day") or []:
+                        used[item["date"]] += float(item["quantity"])
+                remaining = {day: max(0.0, cap[day] - used[day]) for day in days}
+                remaining_inv = max(0.0, usable - inventory_used)
+                for demand in parents:
+                    slot = plan[int(demand["id"])]
+                    if float(slot["allocated"]) > 0.5:
+                        continue
+                    need = float(demand["requested_quantity"])
+                    if penalty_type_of(demand) == "lump_sum":
+                        need = min(need, float(demand.get("confirmed_quantity") or 0.0))
+                    if need <= 0.5:
+                        continue
+                    supply = _supply_by_date(days, remaining, remaining_inv, str(demand["required_date"]))
+                    assert supply + 0.5 < need, (name, demand["demand_code"], supply, need)
 
 
 def test_partial_service_label_and_minimum_useful_default() -> None:

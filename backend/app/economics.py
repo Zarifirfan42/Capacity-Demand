@@ -43,7 +43,7 @@ EMERGENCY_CAPACITY_SHARE = 0.30
 SENSITIVITY_FACTORS = (0.9, 1.1, 0.8, 1.2)
 PENALTY_TYPES = ("lump_sum", "per_m3", "per_day")
 DELAY_TYPES = ("lump_days", "proportional", "per_day")
-SIMPLE_RULES = ("earliest", "penalty_delay", "complete_or_skip", "unit_expected")
+SIMPLE_RULES = ("internal", "external", "earliest", "penalty_delay", "complete_or_skip", "unit_expected")
 
 CRITICALITY_MULT = {
     "Critical": 1.5,
@@ -69,7 +69,7 @@ ASSUMPTIONS = [
     "The all-proportional plan is a labelled comparison. Its regret is its true-terms consequence minus the typed recommendation. A 2×2 minimax is used only when an order is flagged penalty type unverified.",
     f"Inside RM{OBJECTIVE_EPSILON_RM:.0f} of the best expected consequence, the solver minimises partially served orders, then leaves the later order unserved. Earliness is that last tie-break. It does not override a gap larger than the epsilon. RM{OBJECTIVE_EPSILON_RM:.0f} is a visible setting.",
     "Planning certainty weights scale the objective only: Confirmed 100%, Probable 75%, Forecast 45%. These are judgemental weights, not calibrated probabilities. Gross ringgit amounts are still shown in full.",
-    "The headline modelled gap is the best simple rule's expected consequence minus the recommendation, on the same demand and supply. The simple rules are earliest required date, penalty and delay per cubic metre, complete-or-skip for lump-sum orders, and a greedy rank by unit expected consequence. Each bucket uses whichever of those four scores lowest. The gap is at least zero because the recommendation minimises the same objective. It is not observed savings.",
+    "The headline modelled gap is the best simple rule's expected consequence minus the recommendation, on the same demand and supply. The simple rules are internal-first, external-first, earliest required date, penalty and delay per cubic metre, complete-or-skip for lump-sum orders, and a greedy rank by unit expected consequence. Each rule schedules production on the latest feasible day, so an early due date is not starved by a later order. Each bucket uses whichever rule scores lowest. The gap is at least zero because the recommendation minimises the same objective. It is not observed savings.",
     "The contract-uncertainty range re-solves that gap under all-linear terms, the seeded mix, and all-lump terms. It replaces a 60/140% rescaling of penalty and delay cost.",
     "The current-practice proxy ranks firm orders, then due date, then margin and penalty. It ignores programme delay when it chooses, then the consequence still includes that delay. It is a footnote, not the headline.",
     "Inventory carrying cost for the horizon = on-hand value × 8% a year × 30/365. The 8% rate is an assumption. On-hand value itself is not the carrying cost.",
