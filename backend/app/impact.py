@@ -1,9 +1,10 @@
-"""Business impact of the recommendation versus an unassisted planning rule.
+"""Business impact of the recommendation versus named allocation rules.
 
-Earliest-required-date is the baseline. It is what a planner does when the
-rule is 'serve whoever is due first' and the consequence is never priced.
-The pilot is the linear programme. The approved column appears only after a
-person records a decision.
+The headline comparison is earliest-required-date on the same demand and
+supply. That rule is not a record of current practice. The practice proxy is
+an upper bound: it ignores programme delay when it ranks orders, then the
+score still charges the delay. The approved column appears only after a
+person records a decision. None of these figures are observed savings.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import json
 
 from app.db import connect, fetch_all
 from app.economics import ASSUMPTIONS, carrying_cost, round_m3, round_rm
-from app.engine import allocate, load_world
+from app.engine import allocate, load_world, value_protected_band
 
 
 def _blank() -> dict:
@@ -176,19 +177,25 @@ def build_impact() -> dict:
         approved_notes.append("No allocation has been approved yet. The approved column matches the recommendation until a planner records a decision.")
     inventory = _inventory(world, result)
     expedite = _expedite(result)
-    value_protected = round_rm(practice["expected_consequence_rm"] - pilot["expected_consequence_rm"])
-    value_vs_earliest = round_rm(earliest["expected_consequence_rm"] - pilot["expected_consequence_rm"])
+    band = value_protected_band(result)
+    value_protected = band["base_rm"]
     return {
         "horizon": result["horizon"],
-        "baseline_name": "Current practice proxy — illustrative, not observed history",
+        "baseline_name": "Earliest required date — primary comparison, not observed practice",
         "pilot_name": "Optimised — minimise business consequence",
         "approved_name": "Approved — human decision where recorded",
         "columns": [
-            {"key": "practice", "label": "Current practice proxy", "detail": "Illustrative informal rule on the same demand and capacity. Not an observed Chin Hin history.", **practice},
-            {"key": "earliest", "label": "Earliest required date", "detail": "A named priority rule. This is not a claim about how the business allocates today.", **earliest},
+            {"key": "earliest", "label": "Earliest required date", "detail": "Primary comparison on the same demand and capacity. A named rule, not a record of what the plant did.", **earliest},
             {"key": "pilot", "label": "Optimised", "detail": "Linear programme. No internal or external preference.", **pilot},
             {"key": "approved", "label": "Approved plan", "detail": "Latest human decision on each plant and product, otherwise the recommendation.", **approved},
         ],
+        "upper_bound": {
+            "key": "practice",
+            "label": "Current practice proxy — upper bound only",
+            "detail": band["practice_proxy_note"],
+            "gap_rm": band["practice_proxy_gap_rm"],
+            **practice,
+        },
         "reference_policies": [
             {"key": "internal", "label": "Internal projects first", **internal},
             {"key": "external", "label": "External customers first", **external},
@@ -196,8 +203,9 @@ def build_impact() -> dict:
         "inventory": inventory,
         "expedite": expedite,
         "value_protected_rm": value_protected,
-        "value_protected_vs_earliest_rm": value_vs_earliest,
-        "value_protected_note": "Expected consequence of the current-practice proxy minus the optimised recommendation, on the same demand and capacity. The proxy is illustrative. The earliest-date comparison is reported separately and is not current practice.",
+        "value_protected_vs_earliest_rm": value_protected,
+        "value_protected_range": band,
+        "value_protected_note": band["formula"],
         "approved_buckets": len(covered),
         "approved_notes": approved_notes,
         "decisions": [

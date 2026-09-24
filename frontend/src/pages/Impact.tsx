@@ -23,6 +23,15 @@ type Impact = {
   reference_policies: Column[];
   value_protected_rm: number;
   value_protected_note: string;
+  upper_bound: { label: string; detail: string; gap_rm: number; expected_consequence_rm: number };
+  value_protected_range: {
+    low_rm: number;
+    base_rm: number;
+    high_rm: number;
+    practice_proxy_gap_rm: number;
+    practice_proxy_note: string;
+    formula: string;
+  };
   approved_notes: string[];
   assumptions: string[];
   inventory: {
@@ -77,26 +86,30 @@ export function ImpactPage() {
   if (error) return <ErrorNote message={error} />;
   if (!data) return <p>Calculating business impact…</p>;
 
-  const practice = data.columns.find((column) => column.key === "practice");
+  const earliest = data.columns.find((column) => column.key === "earliest");
   const pilot = data.columns.find((column) => column.key === "pilot");
+  const band = data.value_protected_range;
   const chart = [
     { name: "Margin", ...Object.fromEntries(data.columns.map((column) => [column.label, column.margin_at_risk_rm])) },
     { name: "Penalties", ...Object.fromEntries(data.columns.map((column) => [column.label, column.penalty_at_risk_rm])) },
     { name: "Programme delay", ...Object.fromEntries(data.columns.map((column) => [column.label, column.delay_cost_rm])) },
   ];
-  const colors = ["#8aa0b4", "#c4a35a", "#0e6b57", "#1d4e89"];
+  const colors = ["#8aa0b4", "#0e6b57", "#1d4e89"];
 
   return (
     <div className="page">
       <PageHeader
         kicker="Same demand, same capacity"
         title="Business Impact"
-        lede="Every column uses the same plants, products, dates, inventory, and financial assumptions. Only the allocation rule changes. The current-practice proxy is an illustration of informal deal-by-deal planning. It is not an observed history."
+        lede="Every column uses the same plants, products, dates, inventory, and financial assumptions. Only the allocation rule changes. The headline comparison is earliest required date. That rule is not a record of current practice, and the difference is not observed savings."
       />
       <div className="banner good">
-        <strong>Modelled gap versus the current-practice proxy: {rm(data.value_protected_rm)}</strong>
-        Proxy expected consequence {rm(practice?.expected_consequence_rm)} minus the optimised recommendation {rm(pilot?.expected_consequence_rm)}. {data.value_protected_note} This is a modelled gap on the synthetic book, not observed savings.
+        <strong>Modelled gap versus earliest required date: {rm(data.value_protected_rm)}</strong>
+        Earliest-date expected consequence {rm(earliest?.expected_consequence_rm)} minus the recommendation {rm(pilot?.expected_consequence_rm)}. Low {rm(band.low_rm)} at 60% penalty and delay cost. Base {rm(band.base_rm)}. High {rm(band.high_rm)} at 140%. Practice-proxy upper bound {rm(data.upper_bound.gap_rm)}. {data.upper_bound.detail}
       </div>
+      <Panel title="How this number is calculated" sub="Synthetic orders and stated assumptions. Not cash saved.">
+        <p>{band.formula}</p>
+      </Panel>
       <div className="kpi-grid">
         <Kpi label="Inventory value" value={rm(data.inventory.inventory_value_rm)} hint="On-hand × assumed unit cost. This balance is not the carrying cost." />
         <Kpi label="Excess inventory" value={rm(data.inventory.excess_inventory_value_rm)} hint={`${m3(data.inventory.excess_inventory_m3)} above safety stock and 14-day demand.`} />

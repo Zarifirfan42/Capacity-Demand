@@ -25,6 +25,16 @@ type Tower = {
     margin_at_risk_rm: number;
     programme_days_at_risk: number;
     value_protected_rm: number;
+    value_protected_note: string;
+    value_protected_range: {
+      low_rm: number;
+      base_rm: number;
+      high_rm: number;
+      practice_proxy_gap_rm: number;
+      practice_proxy_note: string;
+      formula: string;
+      cases: { label: string; factor: number; value_protected_vs_earliest_rm: number }[];
+    };
     constrained_buckets: number;
   };
   hotspots: {
@@ -38,7 +48,7 @@ type Tower = {
     programme_days: number;
     why: string;
   }[];
-  policy_totals: { optimised_rm: number; earliest_rm: number; internal_first_rm: number; external_first_rm: number };
+  policy_totals: { optimised_rm: number; earliest_rm: number; internal_first_rm: number; external_first_rm: number; practice_rm: number };
   recent_decisions: DecisionRow[];
   exceptions?: { tone: string; text: string; plant_id: number; product_id: number }[];
 };
@@ -57,11 +67,13 @@ export function ControlTowerPage() {
   if (!data) return <p>Loading the planning position…</p>;
   const k = data.kpis;
   const policies = [
+    { name: "Recommended", value: data.policy_totals.optimised_rm },
+    { name: "Internal first", value: data.policy_totals.internal_first_rm },
     { name: "Earliest date", value: data.policy_totals.earliest_rm },
     { name: "External first", value: data.policy_totals.external_first_rm },
-    { name: "Internal first", value: data.policy_totals.internal_first_rm },
-    { name: "Recommended", value: data.policy_totals.optimised_rm },
+    { name: "Proxy upper bound", value: data.policy_totals.practice_rm },
   ];
+  const band = k.value_protected_range;
 
   return (
     <div className="page">
@@ -94,8 +106,17 @@ export function ControlTowerPage() {
         <Kpi label="Inventory at risk" value={rm(k.inventory_at_risk_rm)} hint={k.inventory_at_risk_note} />
         <Kpi label="Margin at risk" value={rm(k.margin_at_risk_rm)} tone="risk" hint="Contribution margin on the unserved fraction" />
         <Kpi label="Programme days at risk" value={num(k.programme_days_at_risk, 1)} tone="risk" hint="Internal delay days scaled by the unserved fraction" />
-        <Kpi label="Modelled gap vs practice proxy" value={rm(k.value_protected_rm)} tone="good" hint="Expected consequence avoided versus the illustrative current-practice proxy. Not observed savings, and not an earliest-date comparison." />
+        <Kpi label="Modelled gap vs earliest date" value={rm(k.value_protected_rm)} tone="good" hint={`${k.value_protected_note} Low ${rm(band.low_rm)} at 60%. Base ${rm(band.base_rm)} at 100%. High ${rm(band.high_rm)} at 140%.`} />
       </div>
+      <Panel title="How this number is calculated" sub="Modelled on the synthetic book. Not observed savings.">
+        <p>{band.formula}</p>
+        <p>
+          At 60% of penalty and delay cost the modelled gap is {rm(band.low_rm)}.
+          At the book values it is {rm(band.base_rm)}.
+          At 140% it is {rm(band.high_rm)}.
+        </p>
+        <p className="note">Practice-proxy gap {rm(band.practice_proxy_gap_rm)}. {band.practice_proxy_note}</p>
+      </Panel>
 
       <div className="split">
         <Panel title="Where demand beats dated supply" sub={`${k.constrained_buckets} plant-product books cannot be fully served.`}>
@@ -129,7 +150,7 @@ export function ControlTowerPage() {
             </table>
           </div>
         </Panel>
-        <Panel title="Consequence by decision rule" sub="Lower is better. The recommendation has no internal or external preference.">
+        <Panel title="Consequence by decision rule" sub="Lower is a smaller modelled consequence. The proxy bar is an upper bound, not the headline comparison.">
           <div className="chart-box short">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={policies} layout="vertical" margin={{ left: 16, right: 12 }}>

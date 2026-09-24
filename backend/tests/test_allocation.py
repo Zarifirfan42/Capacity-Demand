@@ -166,7 +166,29 @@ def test_carrying_cost_is_not_the_inventory_balance() -> None:
     value = impact["inventory"]["inventory_value_rm"]
     assert impact["inventory"]["carrying_cost_rm"] == carrying_cost(value)
     assert impact["inventory"]["carrying_cost_rm"] < value
-    assert any(column["key"] == "practice" for column in impact["columns"])
+    assert impact["columns"][0]["key"] == "earliest"
+
+
+def test_headline_gap_matches_the_earliest_date_rule_and_shows_a_range() -> None:
+    from app.engine import control_tower
+    from app.impact import build_impact
+
+    result = allocate(None)
+    earliest_gap = result["totals"]["value_protected_vs_earliest_rm"]
+    proxy_gap = result["totals"]["value_protected_vs_practice_rm"]
+    tower = control_tower()
+    impact = build_impact()
+    band = tower["kpis"]["value_protected_range"]
+    assert tower["kpis"]["value_protected_rm"] == earliest_gap
+    assert impact["value_protected_rm"] == earliest_gap
+    assert band["base_rm"] == earliest_gap
+    assert impact["value_protected_range"]["base_rm"] == earliest_gap
+    assert [row["factor"] for row in band["cases"]] == [0.6, 1.0, 1.4]
+    assert band["low_rm"] != earliest_gap
+    assert band["high_rm"] != earliest_gap
+    assert proxy_gap > earliest_gap
+    assert impact["upper_bound"]["gap_rm"] == proxy_gap
+    assert "not observed savings" in band["formula"].lower()
 
 
 def test_projected_closing_stock_does_not_go_negative() -> None:

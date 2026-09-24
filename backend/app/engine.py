@@ -97,6 +97,16 @@ def apply_scenario(world: dict, scenario: dict | None) -> dict:
     world = deepcopy(world)
     notes: list[str] = []
     name = scenario.get("name") or "Scenario"
+    scale = scenario.get("penalty_and_delay_factor")
+    if scale is not None and abs(float(scale) - 1.0) > 0.001:
+        scale = float(scale)
+        for demand in world["demands"]:
+            demand["contractual_penalty"] = float(demand["contractual_penalty"]) * scale
+            demand["delay_cost_per_day"] = float(demand["delay_cost_per_day"]) * scale
+        notes.append(
+            f"{name}: contractual penalty and delay cost per day set to {scale:.0%} of the book. "
+            "Contribution margin is unchanged. The allocation is solved again."
+        )
     factor = float(scenario.get("capacity_factor") or 1.0)
     plant_id = scenario.get("plant_id")
     product_id = scenario.get("product_id")
@@ -943,8 +953,62 @@ def capacity_view(plant_id: int, product_id: int) -> dict:
     }
 
 
+def value_protected_band(base: dict | None = None) -> dict:
+    """Earliest-date gap at 60%, 100%, and 140% penalty and delay cost.
+
+    Each case is solved again. The 100% case is the headline. The practice
+    proxy gap is reported beside it as an upper bound, not as the headline.
+    """
+    cases = []
+    for factor, label in ((0.6, "low"), (1.0, "base"), (1.4, "high")):
+        if factor == 1.0 and base is not None:
+            result = base
+        else:
+            result = allocate(
+                None
+                if factor == 1.0
+                else {"name": f"Penalty and delay at {factor:.0%}", "penalty_and_delay_factor": factor}
+            )
+        totals = result["totals"]
+        cases.append(
+            {
+                "factor": factor,
+                "label": label,
+                "optimised_expected_rm": totals["expected_consequence_rm"],
+                "earliest_expected_rm": totals["earliest_expected_consequence_rm"],
+                "value_protected_vs_earliest_rm": totals["value_protected_vs_earliest_rm"],
+                "practice_proxy_gap_rm": totals["value_protected_vs_practice_rm"],
+            }
+        )
+    base_case = next(row for row in cases if row["label"] == "base")
+    return {
+        "headline_basis": "earliest_required_date",
+        "low_rm": cases[0]["value_protected_vs_earliest_rm"],
+        "base_rm": base_case["value_protected_vs_earliest_rm"],
+        "high_rm": cases[2]["value_protected_vs_earliest_rm"],
+        "cases": cases,
+        "practice_proxy_gap_rm": base_case["practice_proxy_gap_rm"],
+        "practice_proxy_note": (
+            "Upper bound only. The proxy ignores programme delay when it ranks orders, "
+            "then the consequence still includes that delay. It is not current practice and not observed savings."
+        ),
+        "formula": (
+            "Modelled gap = expected consequence if orders are served earliest-required-date first, "
+            "minus expected consequence of the recommended allocation. "
+            "Both use the same demand, dated capacity, and usable inventory. "
+            "Expected consequence of what is left unserved = "
+            "(contribution margin + contractual penalty + delay days × cost per day) "
+            "× planning-certainty weight × the unserved fraction. "
+            "Low, base, and high set contractual penalty and delay cost per day to 60%, 100%, and 140% of the book, then solve again. "
+            "Contribution margin is not scaled. "
+            "This is a modelled difference on synthetic orders, not observed savings."
+        ),
+    }
+
+
 def control_tower() -> dict:
     result = allocate(None)
+    band = value_protected_band(result)
     totals = result["totals"]
     inventory_at_risk = 0.0
     for bucket in result["buckets"]:
@@ -991,9 +1055,10 @@ def control_tower() -> dict:
             "penalty_at_risk_rm": totals["penalty_at_risk_rm"],
             "expected_consequence_rm": totals["expected_consequence_rm"],
             "gross_consequence_rm": totals["gross_consequence_rm"],
-            "value_protected_rm": totals["value_protected_vs_practice_rm"],
+            "value_protected_rm": totals["value_protected_vs_earliest_rm"],
             "value_protected_vs_earliest_rm": totals["value_protected_vs_earliest_rm"],
-            "value_protected_note": "Versus the current-practice proxy. The earliest-date comparison is separate and is not a claim about current practice.",
+            "value_protected_note": "Modelled gap versus an earliest-required-date rule on the same supply. Not observed savings, and not a record of current practice.",
+            "value_protected_range": band,
             "constrained_buckets": totals["constrained_buckets"],
         },
         "insight": (
