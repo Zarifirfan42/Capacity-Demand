@@ -58,6 +58,13 @@ export type DemandRow = {
   delay_cost_per_day: number;
   source: string;
   notes: string;
+  penalty_type?: string;
+  delay_type?: string;
+  lump_sum_trigger?: string;
+  penalty_type_unverified?: number;
+  types_unverified?: number;
+  delay_type_unverified?: number;
+  minimum_useful_delivery_m3?: number;
 };
 
 export type AllocationLine = {
@@ -84,6 +91,8 @@ export type AllocationLine = {
   margin_at_risk_rm: number;
   penalty_at_risk_rm: number;
   delay_cost_incurred_rm: number;
+  partial_service_no_penalty_avoided?: boolean;
+  minimum_useful_delivery_m3?: number;
   programme_days: number;
   programme_days_avoided: number;
   consequence_avoided_rm: number;
@@ -147,14 +156,26 @@ export type Bucket = {
   expedite_screen: {
     customer_or_project: string;
     unserved_quantity: number;
+    close_m3?: number;
     emergency_cost_per_m3: number;
     emergency_cost_is_assumption: boolean;
     expedite_cost_rm: number;
-    consequence_if_accepted_rm: number;
+    penalty_and_delay_avoided_rm?: number;
+    avoided_per_rm?: number;
     worth_expediting: boolean;
     net_benefit_rm: number;
     comparison_basis: string;
+    steps_closed?: string[];
   }[];
+  expedite_proposal?: {
+    extra_m3: number;
+    cost_rm: number;
+    avoids_rm: number;
+    net_benefit_rm: number;
+    recommended: boolean;
+    needs_approval: boolean;
+    note: string;
+  };
   decision_review?: {
     level: string;
     owner: string;
@@ -169,10 +190,53 @@ export type Bucket = {
     policy_comparison: string;
     expedite: string;
     maintenance: string[];
+    tie_break?: string;
+    other_close_calls?: string;
   };
   stranded_note: string;
   objective: string;
   solver: string;
+  objective_epsilon_rm?: number;
+  recommendation_basis?: string;
+  comparison?: {
+    typed_plan_true_rm: number;
+    proportional_plan_true_rm?: number;
+    proportional_regret_under_true_terms_rm?: number;
+    typed_plan_if_scored_proportional_rm?: number;
+    proportional_plan_if_scored_proportional_rm?: number;
+    plans_differ?: boolean;
+    note: string;
+    typed_allocations?: { demand_id: number; customer_or_project: string; allocated_m3: number; unserved_m3: number }[];
+    proportional_allocations?: { demand_id: number; customer_or_project: string; allocated_m3: number; unserved_m3: number }[];
+  };
+  unverified_minimax?: {
+    orders: string[];
+    cells_rm: Record<string, number>;
+    max_regret_linear_plan_rm: number;
+    max_regret_lump_plan_rm: number;
+    chosen: string;
+    note: string;
+  } | null;
+  party_burden?: {
+    before: { internal: PartySlice; external: PartySlice } | null;
+    after: { internal: PartySlice; external: PartySlice };
+    note: string;
+  };
+  headline_gap?: {
+    true_rm: number;
+    best_rule?: string;
+    best_rule_label?: string;
+    if_scored_proportional_rm: number;
+    effect_rm: number;
+    note: string;
+  };
+};
+
+export type PartySlice = {
+  unserved_m3: number;
+  consequence_rm: number;
+  unserved_share: number;
+  consequence_share: number;
 };
 
 export type AllocationResult = {

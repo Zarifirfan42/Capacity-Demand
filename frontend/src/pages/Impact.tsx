@@ -24,10 +24,40 @@ type Impact = {
   value_protected_rm: number;
   value_protected_note: string;
   upper_bound: { label: string; detail: string; gap_rm: number; expected_consequence_rm: number };
+  value_protected_vs_earliest_rm?: number;
+  best_rule_by_bucket?: { plant_name: string; product_name: string; best_rule_label?: string; gap_rm: number }[];
+  verify_contracts?: {
+    order_count: number;
+    order_count_note: string;
+    note: string;
+    lines: {
+      demand_code: string;
+      customer_or_project: string;
+      to_penalty_type: string;
+      to_delay_type: string;
+      gap_change_rm: number;
+      allocation_changed: boolean;
+      m3_moved: number;
+      statement: string;
+    }[];
+  };
+  stress?: {
+    constrained_share: number;
+    synthetic_constrained_months_per_year: number;
+    unconditional: { mean_rm: number; p10_rm: number; p50_rm: number; p90_rm: number; share_gap_positive: number };
+    given_constrained: { mean_rm: number; p10_rm: number; p50_rm: number; p90_rm: number };
+    annualised_synthetic: { mean_rm: number; p10_rm: number; p90_rm: number; label: string };
+    caveat: string;
+  } | null;
   value_protected_range: {
     low_rm: number;
     base_rm: number;
     high_rm: number;
+    all_linear_rm?: number;
+    seeded_rm?: number;
+    all_lump_rm?: number;
+    earliest_gap_rm?: number;
+    gap_nonnegative_note?: string;
     practice_proxy_gap_rm: number;
     practice_proxy_note: string;
     formula: string;
@@ -79,6 +109,7 @@ type Impact = {
 export function ImpactPage() {
   const [data, setData] = useState<Impact | null>(null);
   const [error, setError] = useState("");
+  const [realMonths, setRealMonths] = useState<number | null>(null);
 
   useEffect(() => {
     api<Impact>("/api/impact").then(setData).catch((err: Error) => setError(err.message));
@@ -87,7 +118,6 @@ export function ImpactPage() {
   if (error) return <ErrorNote message={error} />;
   if (!data) return <p>Calculating business impact…</p>;
 
-  const earliest = data.columns.find((column) => column.key === "earliest");
   const pilot = data.columns.find((column) => column.key === "pilot");
   const band = data.value_protected_range;
   const chart = [
@@ -95,22 +125,81 @@ export function ImpactPage() {
     { name: "Penalties", ...Object.fromEntries(data.columns.map((column) => [column.label, column.penalty_at_risk_rm])) },
     { name: "Programme delay", ...Object.fromEntries(data.columns.map((column) => [column.label, column.delay_cost_rm])) },
   ];
-  const colors = ["#8aa0b4", "#0e6b57", "#1d4e89"];
+  const colors = ["#8aa0b4", "#1d4e89", "#0e6b57", "#6b5b4b"];
 
   return (
     <div className="page">
       <PageHeader
         kicker="Same demand, same capacity"
         title="Business Impact"
-        lede="Every column uses the same plants, products, dates, inventory, and financial assumptions. Only the allocation rule changes. The headline comparison is earliest required date. That rule is not a record of current practice, and the difference is not observed savings."
+        lede="Every column uses the same plants, products, dates, inventory, and financial assumptions. Only the allocation rule changes. The headline comparison is the best simple rule. Earliest required date is second. The difference is not observed savings."
       />
       <div className="banner good">
-        <strong>Modelled gap versus earliest required date: {rm(data.value_protected_rm)}</strong>
-        Earliest-date expected consequence {rm(earliest?.expected_consequence_rm)} minus the recommendation {rm(pilot?.expected_consequence_rm)}. Low {rm(band.low_rm)} at 60% penalty and delay cost. Base {rm(band.base_rm)}. High {rm(band.high_rm)} at 140%. Practice-proxy upper bound {rm(data.upper_bound.gap_rm)}. {data.upper_bound.detail}
+        <strong>Modelled gap versus the best simple rule: {rm(data.value_protected_rm)}</strong>
+        Best-rule expected consequence {rm(data.columns.find((column) => column.key === "best")?.expected_consequence_rm)} minus the recommendation {rm(pilot?.expected_consequence_rm)}. All-linear {rm(band.all_linear_rm ?? band.low_rm)}. Seeded mix {rm(band.seeded_rm ?? band.base_rm)}. All-lump {rm(band.all_lump_rm ?? band.high_rm)}. Earliest-date gap {rm(data.value_protected_vs_earliest_rm ?? 0)}.
       </div>
       <Panel title="How this number is calculated" sub="Synthetic orders and stated assumptions. Not cash saved.">
         <p>{band.formula}</p>
+        <p className="note">{band.gap_nonnegative_note}</p>
+        <p className="note">Practice-proxy footnote: {rm(data.upper_bound.gap_rm)}. {data.upper_bound.detail}</p>
       </Panel>
+      {data.verify_contracts ? (
+        <Panel title="Verify these contracts first" sub={data.verify_contracts.note}>
+          <p className="note">{data.verify_contracts.order_count_note} {data.verify_contracts.order_count} lines.</p>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Order</th>
+                  <th>Flipped to</th>
+                  <th className="num">Gap change</th>
+                  <th className="num">m³ moved</th>
+                  <th>Allocation</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.verify_contracts.lines.slice(0, 8).map((row) => (
+                  <tr key={row.demand_code}>
+                    <td>{row.customer_or_project}</td>
+                    <td>{row.to_penalty_type} / {row.to_delay_type}</td>
+                    <td className="num">{rm(row.gap_change_rm)}</td>
+                    <td className="num">{m3(row.m3_moved)}</td>
+                    <td>{row.allocation_changed ? row.statement : "Score only"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      ) : null}
+      {data.stress ? (
+        <Panel title="Synthetic months" sub="200 seeded months. Not a forecast of this plant.">
+          <p>
+            Constrained in {Math.round(data.stress.constrained_share * 100)}% of months.
+            Unconditional gap p10 {rm(data.stress.unconditional.p10_rm)}, p50 {rm(data.stress.unconditional.p50_rm)}, p90 {rm(data.stress.unconditional.p90_rm)}.
+            Given a constrained month, mean {rm(data.stress.given_constrained.mean_rm)}.
+          </p>
+          <p>Synthetic annualised range, 12 × the unconditional monthly gap: {rm(data.stress.annualised_synthetic.p10_rm)} to {rm(data.stress.annualised_synthetic.p90_rm)}, mean {rm(data.stress.annualised_synthetic.mean_rm)}. {data.stress.annualised_synthetic.label}</p>
+          <label>
+            Real constrained months per year
+            <input
+              type="number"
+              min={0}
+              max={12}
+              step={0.1}
+              value={realMonths ?? data.stress.synthetic_constrained_months_per_year}
+              onChange={(event) => setRealMonths(Number(event.target.value))}
+            />
+          </label>
+          <p>
+            At that frequency the annual figure is {rm((realMonths ?? data.stress.synthetic_constrained_months_per_year) * data.stress.given_constrained.mean_rm)}.
+            It replaces the synthetic mix of quiet and short months with the plant's own frequency.
+          </p>
+          <p className="note">{data.stress.caveat}</p>
+        </Panel>
+      ) : (
+        <p className="note">The 200-month stress report has not been written yet. Run python -m app.stress from the backend.</p>
+      )}
       <div className="kpi-grid">
         <Kpi label="Inventory value" value={rm(data.inventory.inventory_value_rm)} hint="On-hand × assumed unit cost. This balance is not the carrying cost." />
         <Kpi label="Excess inventory" value={rm(data.inventory.excess_inventory_value_rm)} hint={`${m3(data.inventory.excess_inventory_m3)} of precast above safety stock and ${data.inventory.excess_cover_days}-day demand.`} />

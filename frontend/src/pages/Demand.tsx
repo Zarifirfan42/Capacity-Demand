@@ -316,8 +316,8 @@ export function DemandPage() {
         <Panel title={selected.customer_or_project} sub={`${selected.demand_code} · ${selected.notes}`}>
           <div className="detail">
             <p>Commercial consequence if fully missed: {rm(selected.contribution_margin)} contribution margin.</p>
-            <p>Customer consequence: {rm(selected.contractual_penalty)} contractual penalty.</p>
-            <p>Project consequence: {selected.delay_days_if_unserved} days at {rm(selected.delay_cost_per_day)} per day.</p>
+            <p>Customer consequence: {rm(selected.contractual_penalty)} contractual penalty, type {selected.penalty_type || "per_m3"}{selected.types_unverified ? " (unverified)" : ""}, trigger {selected.lump_sum_trigger || "any"}.</p>
+            <p>Project consequence: {selected.delay_days_if_unserved} days at {rm(selected.delay_cost_per_day)} per day, delay type {selected.delay_type || "proportional"}{selected.delay_type_unverified || selected.types_unverified ? " (unverified)" : ""}. The penalty sits on the confirmed tranche. Programme delay uses the same tranche weights as margin: confirmed cubic metres at 100%, remainder at its confidence. Minimum useful delivery {m3(selected.minimum_useful_delivery_m3 || 0)}.</p>
             <p>Operational constraint: {selected.product_name} at {selected.plant_name}, on or before {longDate(selected.required_date)}. It cannot use another product or plant.</p>
             <p>The solver treats {m3(selected.confirmed_quantity)} as confirmed, at a 100% planning-certainty weight. The remaining {m3(Math.max(0, selected.requested_quantity - selected.confirmed_quantity))} is a separate tranche at 75%, or 45% if this line is a forecast.</p>
             {selected.demand_code.includes("-IN-") ? (

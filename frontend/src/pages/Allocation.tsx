@@ -16,6 +16,12 @@ type Preview = {
 
 const BASELINE = { name: "Baseline", capacity_factor: 1, plant_id: null, product_id: null, inventory_adjustments: [], demand_adjustments: [] };
 
+type Fragility = {
+  fragile: boolean;
+  summary: string;
+  flip_point: string;
+};
+
 export function AllocationPage() {
   const { name } = usePlanner();
   const [params] = useSearchParams();
@@ -28,6 +34,10 @@ export function AllocationPage() {
   const [preview, setPreview] = useState<Preview | null>(null);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState("");
+  const [fragility, setFragility] = useState<Fragility | null>(null);
+  const [chosenPlan, setChosenPlan] = useState("");
+  const [termLines, setTermLines] = useState<{ statement: string }[]>([]);
+  const [termsConfirmed, setTermsConfirmed] = useState(false);
 
   function refreshDecisions() {
     api<{ rows: DecisionRow[] }>("/api/decisions").then((payload) => setDecisions(payload.rows)).catch(() => undefined);
@@ -51,6 +61,20 @@ export function AllocationPage() {
     () => result?.buckets.find((item) => `${item.plant_id}-${item.product_id}` === key),
     [result, key],
   );
+
+  useEffect(() => {
+    if (!bucket) return;
+    setFragility(null);
+    setChosenPlan("");
+    setTermsConfirmed(false);
+    setTermLines([]);
+    api<Fragility>(`/api/fragility?plant_id=${bucket.plant_id}&product_id=${bucket.product_id}`)
+      .then(setFragility)
+      .catch(() => setFragility(null));
+    api<{ lines: { statement: string }[] }>(`/api/contract-flips?plant_id=${bucket.plant_id}&product_id=${bucket.product_id}`)
+      .then((payload) => setTermLines(payload.lines))
+      .catch(() => setTermLines([]));
+  }, [bucket]);
 
   useEffect(() => {
     if (!bucket) return;
@@ -83,6 +107,17 @@ export function AllocationPage() {
     return () => window.clearTimeout(handle);
   }, [bucket, edits]);
 
+  function applyChoice(plan: "typed" | "proportional") {
+    if (!bucket?.comparison) return;
+    const rows = plan === "typed" ? bucket.comparison.typed_allocations : bucket.comparison.proportional_allocations;
+    const next: Record<number, number> = { ...edits };
+    for (const row of rows ?? []) next[row.demand_id] = row.allocated_m3;
+    setEdits(next);
+    setChosenPlan(plan);
+  }
+
+  const mustChoose = Boolean(fragility?.fragile && bucket?.comparison?.plans_differ);
+
   async function record() {
     if (!bucket) return;
     setError("");
@@ -95,6 +130,8 @@ export function AllocationPage() {
           product_id: bucket.product_id,
           override_reason: reason,
           reason_category: category,
+          chosen_plan: chosenPlan,
+          terms_confirmed: termsConfirmed,
           allocations: bucket.allocations.map((line) => ({
             demand_id: line.demand_id,
             allocated_quantity: Number(edits[line.demand_id] ?? 0),
@@ -152,7 +189,13 @@ export function AllocationPage() {
         <Panel title="Who reviews this recommendation" sub={bucket.decision_review.level}>
           <p><strong>{bucket.decision_review.owner}</strong></p>
           <p>{bucket.decision_review.evidence}</p>
-          {bucket.decision_review.triggers.length ? <ul>{bucket.decision_review.triggers.map((item) => <li key={item}>{item}</li>)}</ul> : null}
+          {bucket.decision_review.triggers.length || fragility?.fragile ? (
+            <ul>
+              {bucket.decision_review.triggers.map((item) => <li key={item}>{item}</li>)}
+              {fragility?.fragile ? <li>The recommendation is fragile. Keeping it under a 10% or 20% shock costs more than the re-solved optimum by the regret bar.</li> : null}
+              {termLines.map((row) => <li key={row.statement}>{row.statement}</li>)}
+            </ul>
+          ) : null}
           <p className="note">The review lines are modelling assumptions. They are not a head-office policy.</p>
         </Panel>
       ) : null}
@@ -164,6 +207,60 @@ export function AllocationPage() {
             {bucket.explanation.ranking.map((line) => <li key={line}>{line.replace(/^\d+\.\s*/, "")}</li>)}
           </ol>
           {bucket.explanation.tradeoff ? <p className="tradeoff">{bucket.explanation.tradeoff}</p> : null}
+          {bucket.explanation.other_close_calls ? <p>{bucket.explanation.other_close_calls}</p> : null}
+          {fragility ? (
+            <p className={fragility.fragile ? "tradeoff" : "note"}>{fragility.summary}</p>
+          ) : (
+            <p className="note">Checking whether a 10% or 20% change in one order’s unit expected consequence changes who is left unserved.</p>
+          )}
+          {bucket.comparison ? (
+            <div>
+              <p>{bucket.comparison.note}</p>
+              <p>
+                Typed plan under true terms {rm(bucket.comparison.typed_plan_true_rm)}.
+                Proportional plan under true terms {rm(bucket.comparison.proportional_plan_true_rm ?? 0)}.
+                Regret of using the proportional plan {rm(bucket.comparison.proportional_regret_under_true_terms_rm ?? 0)}.
+              </p>
+              <p className="note">
+                Scored as if every term were linear: typed plan {rm(bucket.comparison.typed_plan_if_scored_proportional_rm ?? 0)}, proportional plan {rm(bucket.comparison.proportional_plan_if_scored_proportional_rm ?? 0)}.
+                Epsilon for the tie-break is {rm(bucket.objective_epsilon_rm ?? 0)}.
+              </p>
+              {bucket.headline_gap ? <p>{bucket.headline_gap.note} On this plant and product the true gap is {rm(bucket.headline_gap.true_rm)}, the linear scoring of the same two allocations is {rm(bucket.headline_gap.if_scored_proportional_rm)}, and the effect is {rm(bucket.headline_gap.effect_rm)}.</p> : null}
+            </div>
+          ) : null}
+          {bucket.unverified_minimax ? (
+            <p className="tradeoff">
+              {bucket.unverified_minimax.note} Unverified orders: {bucket.unverified_minimax.orders.join(", ")}. Maximum regret of the linear reading {rm(bucket.unverified_minimax.max_regret_linear_plan_rm)}. Maximum regret of the lump-sum reading {rm(bucket.unverified_minimax.max_regret_lump_plan_rm)}. Chosen reading: {bucket.unverified_minimax.chosen}.
+            </p>
+          ) : null}
+          {bucket.party_burden ? (
+            <p>
+              {bucket.party_burden.note} Before, internal unserved {m3(bucket.party_burden.before?.internal.unserved_m3 ?? 0)} ({Math.round((bucket.party_burden.before?.internal.unserved_share ?? 0) * 100)}%) and consequence {rm(bucket.party_burden.before?.internal.consequence_rm ?? 0)}; external unserved {m3(bucket.party_burden.before?.external.unserved_m3 ?? 0)} and consequence {rm(bucket.party_burden.before?.external.consequence_rm ?? 0)}. After, internal unserved {m3(bucket.party_burden.after.internal.unserved_m3)} ({Math.round(bucket.party_burden.after.internal.unserved_share * 100)}%) and consequence {rm(bucket.party_burden.after.internal.consequence_rm)}; external unserved {m3(bucket.party_burden.after.external.unserved_m3)} and consequence {rm(bucket.party_burden.after.external.consequence_rm)}.
+            </p>
+          ) : null}
+          {fragility?.fragile && bucket.comparison?.plans_differ ? (
+            <div>
+              <p className="tradeoff">This bucket is fragile and the two plans differ. Choose one before recording.</p>
+              <label className="note">
+                <input type="radio" name="plan" checked={chosenPlan === "typed"} onChange={() => applyChoice("typed")} /> Typed recommendation
+              </label>
+              <label className="note">
+                <input type="radio" name="plan" checked={chosenPlan === "proportional"} onChange={() => applyChoice("proportional")} /> Proportional comparison
+              </label>
+              <div className="split">
+                <ul>
+                  {(bucket.comparison.typed_allocations ?? []).map((row) => (
+                    <li key={`t-${row.demand_id}`}>{row.customer_or_project}: typed {m3(row.allocated_m3)}</li>
+                  ))}
+                </ul>
+                <ul>
+                  {(bucket.comparison.proportional_allocations ?? []).map((row) => (
+                    <li key={`p-${row.demand_id}`}>{row.customer_or_project}: proportional {m3(row.allocated_m3)}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          ) : null}
           <p>{bucket.explanation.policy_comparison}</p>
           {bucket.stranded_note ? <p>{bucket.stranded_note}</p> : null}
           {bucket.explanation.maintenance.map((note) => <p key={note}>{note}</p>)}
@@ -272,32 +369,47 @@ export function AllocationPage() {
           <label>Reason for the decision</label>
           <textarea value={reason} onChange={(event) => setReason(event.target.value)} />
         </div>
-        <button className="btn primary" disabled={preview?.feasible === false || !name.trim()} onClick={() => void record()}>
+        {termLines.length > 0 ? (
+          <label className="check">
+            <input type="checkbox" checked={termsConfirmed} onChange={(event) => setTermsConfirmed(event.target.checked)} />
+            Commercial owner confirms the unverified contract term before sign-off.
+          </label>
+        ) : null}
+        <button className="btn primary" disabled={preview?.feasible === false || !name.trim() || (mustChoose && !chosenPlan) || (termLines.length > 0 && !termsConfirmed)} onClick={() => void record()}>
           Record decision as {name || "planner"}
         </button>
       </Panel>
 
       {bucket.expedite_screen.length > 0 ? (
-        <Panel title="Expedite screen" sub="Assumption only. Emergency cost is not added to plant capacity unless a scenario raises it.">
+        <Panel title="Expedite screen" sub="Cost to close a firing lump. Emergency supply is a proposal, not base capacity.">
+          {bucket.expedite_proposal?.recommended ? (
+            <p className="tradeoff">
+              Recommended expedite: {m3(bucket.expedite_proposal.extra_m3)}, cost {rm(bucket.expedite_proposal.cost_rm)}, avoids {rm(bucket.expedite_proposal.avoids_rm)}. {bucket.expedite_proposal.note}
+            </p>
+          ) : (
+            <p className="note">{bucket.expedite_proposal?.note}</p>
+          )}
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
                   <th>Unserved order</th>
-                  <th className="num">Quantity</th>
+                  <th className="num">Close the step</th>
                   <th className="num">Emergency cost</th>
-                  <th className="num">Consequence if accepted</th>
+                  <th className="num">Penalty and delay avoided</th>
+                  <th className="num">Avoided per RM</th>
                   <th>Judgement</th>
                 </tr>
               </thead>
               <tbody>
                 {bucket.expedite_screen.map((row) => (
                   <tr key={row.customer_or_project}>
-                    <td>{row.customer_or_project}<div className="note">{row.comparison_basis}. RM{row.emergency_cost_per_m3}/m³ is an assumption.</div></td>
-                    <td className="num">{m3(row.unserved_quantity)}</td>
+                    <td>{row.customer_or_project}<div className="note">{row.comparison_basis}</div></td>
+                    <td className="num">{m3(row.close_m3 ?? row.unserved_quantity)}</td>
                     <td className="num">{rm(row.expedite_cost_rm)}</td>
-                    <td className="num">{rm(row.consequence_if_accepted_rm)}</td>
-                    <td>{row.worth_expediting ? `Worth a human decision. Net benefit ${rm(row.net_benefit_rm)}.` : "Do not expedite. The emergency cost is larger than the consequence."}</td>
+                    <td className="num">{rm(row.penalty_and_delay_avoided_rm ?? 0)}</td>
+                    <td className="num">{row.avoided_per_rm ?? 0}</td>
+                    <td>{row.worth_expediting ? `Worth a human decision. Net benefit ${rm(row.net_benefit_rm)}.` : "The emergency cost is larger than the lump it would turn off."}</td>
                   </tr>
                 ))}
               </tbody>
