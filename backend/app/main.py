@@ -7,11 +7,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app.db import connect, fetch_all, fetch_one
+from app.auth import auth_status, require_admin, require_writer
+from app.db import connect, fetch_all, fetch_one, persistence_backend, reset_data
 from app.economics import ASSUMPTIONS, HORIZON_END, HORIZON_START
 from app.engine import (
     allocate,
@@ -29,6 +30,19 @@ from app.engine import (
 from app.extractor import SAMPLE_EMAIL, SAMPLE_OCR, extract_demand
 from app.forecast import build_forecast
 from app.impact import build_impact
+from app.measurement import build_illustration, build_measurement
+from app.operations import (
+    assert_replaceable,
+    buffer_days,
+    log_replacement,
+    plant_mode,
+    release_commitment,
+    schedule_commitment,
+    set_buffer_days,
+    set_plant_mode,
+    validate_actuals,
+    write_commitment,
+)
 from app.quality import assess
 from app.seed import seed
 
@@ -147,11 +161,20 @@ class DecisionIn(OverrideIn):
     reason_category: str = ""
     chosen_plan: str = ""
     terms_confirmed: bool = False
+    replace: bool = False
+
+
+class ActualLineIn(BaseModel):
+    demand_id: int
+    delivered_m3: float = Field(ge=0)
+    actual_delivery_date: str
+    programme_days_lost: float = 0
+    penalty_paid_rm: float = 0
 
 
 class ActualIn(BaseModel):
     username: str = Field(min_length=2, max_length=80)
-    allocations: list[AllocationLineIn]
+    lines: list[ActualLineIn]
     note: str = ""
 
 
@@ -183,7 +206,7 @@ def _targets(world: dict, plant_id: int, product_id: int, lines: list[Allocation
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "solver": "CBC linear programme"}
+    return {"status": "ok", "solver": "CBC linear programme", "persistence": persistence_backend()}
 
 
 @app.get("/api/meta")
@@ -308,7 +331,7 @@ def extract(body: ExtractIn) -> dict:
 
 
 @app.post("/api/demands")
-def create_demand(body: DemandCreate) -> dict:
+def create_demand(body: DemandCreate, _: str = Depends(require_writer)) -> dict:
     try:
         required = parse_user_date(body.required_date)
     except ValueError as exc:
@@ -362,7 +385,7 @@ def create_demand(body: DemandCreate) -> dict:
 
 
 @app.delete("/api/demands/{demand_id}")
-def delete_demand(demand_id: int) -> dict:
+def delete_demand(demand_id: int, _: str = Depends(require_writer)) -> dict:
     with connect() as conn:
         row = fetch_one(conn, "SELECT * FROM demands WHERE id = ?", (demand_id,))
         if row is None:
@@ -456,15 +479,26 @@ def preview_override(body: OverrideIn) -> dict:
 
 
 @app.post("/api/decisions")
-def record_decision(body: DecisionIn) -> dict:
+def record_decision(body: DecisionIn, _: str = Depends(require_writer)) -> dict:
     try:
         scenario = _scenario_dict(body.scenario)
         world = apply_scenario(load_world(), scenario)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        previous = assert_replaceable(body.plant_id, body.product_id, body.replace)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if previous is not None:
+        release_commitment(previous)
+        world = apply_scenario(load_world(), scenario)
     targets = _targets(world, body.plant_id, body.product_id, body.allocations)
     fit = feasibility(world, body.plant_id, body.product_id, targets)
     if not fit["feasible"]:
+        if previous is not None:
+            write_commitment(body.plant_id, body.product_id, json.loads(previous.get("committed_json") or "{}"))
+            with connect() as conn:
+                conn.execute("UPDATE decisions SET status = ? WHERE id = ?", (previous["status"], previous["id"]))
         raise HTTPException(status_code=400, detail=fit["message"])
     bucket = solve_bucket(world, body.plant_id, body.product_id)
     scored = score_targets(world, body.plant_id, body.product_id, targets)
@@ -557,6 +591,14 @@ def record_decision(body: DecisionIn) -> dict:
         )
         decision_id = cursor.lastrowid
         saved = fetch_one(conn, "SELECT * FROM decisions WHERE id = ?", (decision_id,))
+    if plant_mode(body.plant_id) == "pilot":
+        schedule = schedule_commitment(world, body.plant_id, body.product_id, targets)
+        write_commitment(body.plant_id, body.product_id, schedule)
+        with connect() as conn:
+            conn.execute("UPDATE decisions SET committed_json = ? WHERE id = ?", (json.dumps(schedule), decision_id))
+            saved = fetch_one(conn, "SELECT * FROM decisions WHERE id = ?", (decision_id,))
+    if previous is not None:
+        log_replacement(int(previous["id"]), int(decision_id), body.username.strip())
     return {"decision": _hydrate_decision(saved), "status": status, "reason_categories": list(REASON_CATEGORIES)}
 
 
@@ -596,38 +638,22 @@ def list_decisions(
 
 
 @app.post("/api/decisions/{decision_id}/actual")
-def record_actual(decision_id: int, body: ActualIn) -> dict:
-    """Record what was actually supplied. This does not change the recommendation."""
+def record_actual(decision_id: int, body: ActualIn, _: str = Depends(require_writer)) -> dict:
+    """Record delivered quantities and cash. This locks the decision."""
     with connect() as conn:
         row = fetch_one(conn, "SELECT * FROM decisions WHERE id = ?", (decision_id,))
         if row is None:
             raise HTTPException(status_code=404, detail="Decision not found.")
-        recommended = json.loads(row["recommended_json"])
         final = json.loads(row["final_json"])
-        recommended_qty = {line["demand_id"]: float(line["allocated_quantity"]) for line in recommended.get("allocations", [])}
-        approved_qty = {line["demand_id"]: float(line["allocated_quantity"]) for line in final.get("allocations", [])}
-        requested = {line["demand_id"]: float(line["requested_quantity"]) for line in final.get("allocations", [])}
-        incoming = {line.demand_id: line.allocated_quantity for line in body.allocations}
-        if set(incoming) != set(approved_qty):
-            raise HTTPException(status_code=400, detail="Actual quantities must cover the same demand lines as the approved allocation.")
-        lines = []
-        for demand_id, actual_qty in incoming.items():
-            if actual_qty < -0.01 or actual_qty > requested[demand_id] + 0.05:
-                raise HTTPException(status_code=400, detail="An actual quantity cannot be negative or above the requested quantity.")
-            lines.append(
-                {
-                    "demand_id": demand_id,
-                    "recommended_m3": round(recommended_qty.get(demand_id, 0.0), 2),
-                    "approved_m3": round(approved_qty[demand_id], 2),
-                    "actual_m3": round(actual_qty, 2),
-                    "decision_variance_m3": round(approved_qty[demand_id] - recommended_qty.get(demand_id, 0.0), 2),
-                    "execution_variance_m3": round(actual_qty - approved_qty[demand_id], 2),
-                }
-            )
+        try:
+            lines = validate_actuals(final.get("allocations", []), [line.model_dump() for line in body.lines])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         payload = {
             "note": body.note.strip(),
             "lines": lines,
-            "basis": "Recorded outcome on the synthetic book. It is not an observed Chin Hin delivery.",
+            "entered_by": body.username.strip(),
+            "basis": "Entered from the dispatch log, site diary, and commercial register. Synthetic until those documents exist.",
         }
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         conn.execute(
@@ -675,7 +701,7 @@ def forecast() -> dict:
 
 
 @app.post("/api/forecast/adjustment")
-def forecast_adjustment(body: AdjustmentIn) -> dict:
+def forecast_adjustment(body: AdjustmentIn, _: str = Depends(require_writer)) -> dict:
     with connect() as conn:
         conn.execute(
             """
@@ -768,6 +794,217 @@ def compare_scenarios(body: CompareIn) -> dict:
 @app.get("/api/impact")
 def impact() -> dict:
     return build_impact()
+
+
+@app.get("/api/auth-status")
+def get_auth_status() -> dict:
+    return auth_status()
+
+
+@app.get("/api/operations")
+def operations_state() -> dict:
+    world = load_world()
+    return {
+        "buffer_days": buffer_days(),
+        "persistence": persistence_backend(),
+        "plants": [{"id": plant["id"], "name": plant["name"], "mode": plant_mode(plant["id"])} for plant in world["plants"]],
+        "auth": auth_status(),
+    }
+
+
+class ModeIn(BaseModel):
+    mode: Literal["shadow", "pilot"]
+
+
+class BufferIn(BaseModel):
+    buffer_days: int = Field(ge=0, le=14)
+
+
+class InformalIn(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+    plant_id: int
+    product_id: int
+    allocations: list[AllocationLineIn]
+
+
+class SnapshotIn(BaseModel):
+    plant_id: int
+    product_id: int
+    as_of_date: str
+    on_hand: float = Field(ge=0)
+    safety_stock: float = Field(ge=0)
+    entered_by: str = Field(min_length=2, max_length=80)
+
+
+class ExpediteIn(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+    plant_id: int
+    product_id: int
+    demand_id: int
+    customer_or_project: str
+    decision: Literal["approve", "decline"]
+    emergency_rm_per_m3: float = Field(ge=0)
+    available_volume_m3: float = Field(ge=0)
+    cost_rm: float = Field(ge=0)
+    penalty_would_apply_rm: float = Field(ge=0)
+    delivered_in_full: bool | None = None
+    on_time: bool | None = None
+    penalty_paid_rm: float | None = None
+    note: str = ""
+
+
+@app.post("/api/plants/{plant_id}/mode")
+def update_mode(plant_id: int, body: ModeIn, _: str = Depends(require_writer)) -> dict:
+    try:
+        mode = set_plant_mode(plant_id, body.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"plant_id": plant_id, "mode": mode}
+
+
+@app.post("/api/buffer-days")
+def update_buffer(body: BufferIn, _: str = Depends(require_writer)) -> dict:
+    return {"buffer_days": set_buffer_days(body.buffer_days)}
+
+
+@app.post("/api/informal-plans")
+def record_informal(body: InformalIn, _: str = Depends(require_writer)) -> dict:
+    world = load_world()
+    targets = _targets(world, body.plant_id, body.product_id, body.allocations)
+    fit = feasibility(world, body.plant_id, body.product_id, targets)
+    if not fit["feasible"]:
+        raise HTTPException(status_code=400, detail=fit["message"])
+    bucket = solve_bucket(world, body.plant_id, body.product_id, include_comparison=False, include_expedite=False)
+    recommended_targets = {int(line["demand_id"]): float(line["allocated_quantity"]) for line in bucket["allocations"]}
+    informal_expected = float(score_targets(world, body.plant_id, body.product_id, targets)["expected_consequence_rm"])
+    recommendation_expected = float(bucket["expected_consequence_rm"])
+    paired = round(informal_expected - recommendation_expected, 2)
+    payload = {
+        "allocations": [{"demand_id": demand_id, "allocated_quantity": qty} for demand_id, qty in targets.items()],
+    }
+    recommendation = {
+        "allocations": [{"demand_id": demand_id, "allocated_quantity": qty} for demand_id, qty in recommended_targets.items()],
+        "expected_consequence_rm": recommendation_expected,
+    }
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO informal_plans(
+                created_at, username, plant_id, product_id, quantities_json, recommendation_json,
+                informal_expected_rm, recommendation_expected_rm, paired_gap_rm
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                body.username.strip(),
+                body.plant_id,
+                body.product_id,
+                json.dumps(payload),
+                json.dumps(recommendation),
+                informal_expected,
+                recommendation_expected,
+                paired,
+            ),
+        )
+        plan_id = cursor.lastrowid
+    return {
+        "id": plan_id,
+        "paired_gap_rm": paired,
+        "informal_expected_rm": informal_expected,
+        "recommendation_expected_rm": recommendation_expected,
+        "definition": "Observed informal plan minus the modelled recommendation, scored on this same book.",
+    }
+
+
+@app.get("/api/informal-plans")
+def list_informal(plant_id: int | None = None, product_id: int | None = None) -> dict:
+    clauses = ["1=1"]
+    params: list = []
+    if plant_id:
+        clauses.append("plant_id = ?")
+        params.append(plant_id)
+    if product_id:
+        clauses.append("product_id = ?")
+        params.append(product_id)
+    with connect() as conn:
+        rows = fetch_all(conn, f"SELECT * FROM informal_plans WHERE {' AND '.join(clauses)} ORDER BY id DESC", tuple(params))
+    for row in rows:
+        row["quantities"] = json.loads(row.pop("quantities_json"))
+        row["recommendation"] = json.loads(row.pop("recommendation_json"))
+    return {"rows": rows}
+
+
+@app.post("/api/inventory-snapshots")
+def record_snapshot(body: SnapshotIn, _: str = Depends(require_writer)) -> dict:
+    try:
+        as_of = parse_user_date(body.as_of_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO inventory_snapshots(plant_id, product_id, as_of_date, on_hand, safety_stock, entered_by, entered_at, synthetic)
+            VALUES(?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(plant_id, product_id, as_of_date) DO UPDATE SET
+                on_hand = excluded.on_hand,
+                safety_stock = excluded.safety_stock,
+                entered_by = excluded.entered_by,
+                entered_at = excluded.entered_at
+            """,
+            (body.plant_id, body.product_id, as_of, body.on_hand, body.safety_stock, body.entered_by.strip(), now),
+        )
+    return {"as_of_date": as_of, "entered_by": body.entered_by.strip(), "entered_at": now}
+
+
+@app.post("/api/expedite-decisions")
+def record_expedite(body: ExpediteIn, _: str = Depends(require_writer)) -> dict:
+    estimated = None
+    if body.delivered_in_full and body.on_time and body.penalty_paid_rm is not None and body.decision == "approve":
+        estimated = round(max(0.0, body.penalty_would_apply_rm - body.penalty_paid_rm), 2)
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO expedite_decisions(
+                created_at, username, plant_id, product_id, demand_id, customer_or_project, decision,
+                emergency_rm_per_m3, available_volume_m3, cost_rm, penalty_would_apply_rm,
+                delivered_in_full, on_time, penalty_paid_rm, estimated_avoided_rm, note
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                body.username.strip(),
+                body.plant_id,
+                body.product_id,
+                body.demand_id,
+                body.customer_or_project.strip(),
+                body.decision,
+                body.emergency_rm_per_m3,
+                body.available_volume_m3,
+                body.cost_rm,
+                body.penalty_would_apply_rm,
+                None if body.delivered_in_full is None else int(body.delivered_in_full),
+                None if body.on_time is None else int(body.on_time),
+                body.penalty_paid_rm,
+                estimated,
+                body.note.strip(),
+            ),
+        )
+        row_id = cursor.lastrowid
+    return {"id": row_id, "estimated_avoided_rm": estimated, "label": "estimated avoided"}
+
+
+@app.get("/api/measurement")
+def measurement() -> dict:
+    return build_measurement()
+
+
+@app.post("/api/admin/reset")
+def admin_reset(_: str = Depends(require_admin)) -> dict:
+    with connect() as conn:
+        reset_data(conn)
+    seed()
+    return {"status": "reset", "label": "Synthetic demo data restored. Recorded decisions and actuals were deleted by an admin."}
 
 
 # The built UI is served by Vercel. API routes stay on this app and take priority.
