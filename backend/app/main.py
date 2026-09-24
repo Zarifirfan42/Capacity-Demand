@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app.auth import auth_status, require_admin, require_writer
+from app.auth import auth_status, require_admin, require_roles, require_writer
 from app.db import connect, fetch_all, fetch_one, persistence_backend, reset_data
 from app.economics import ASSUMPTIONS, HORIZON_END, HORIZON_START
 from app.engine import (
@@ -490,6 +491,9 @@ def record_decision(body: DecisionIn, _: str = Depends(require_writer)) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if previous is not None:
+        from app.governance import release_hold
+
+        release_hold(previous)
         release_commitment(previous)
         world = apply_scenario(load_world(), scenario)
     targets = _targets(world, body.plant_id, body.product_id, body.allocations)
@@ -507,7 +511,6 @@ def record_decision(body: DecisionIn, _: str = Depends(require_writer)) -> dict:
     reason = body.override_reason.strip()
     if changed and len(reason) < 8:
         raise HTTPException(status_code=400, detail="A modified allocation needs a reason of at least a short sentence.")
-    status = "modified" if changed else "approved"
     category = body.reason_category.strip()
     if changed:
         if not category:
@@ -515,7 +518,8 @@ def record_decision(body: DecisionIn, _: str = Depends(require_writer)) -> dict:
         if category not in REASON_CATEGORIES:
             raise HTTPException(status_code=400, detail=f"Override category must be one of: {', '.join(REASON_CATEGORIES)}.")
     else:
-        category = category or "Accepted recommendation"
+        reason = "Accepted as recommended"
+        category = ""
     open_terms = [
         row
         for row in value_of_information()["lines"]
@@ -530,12 +534,27 @@ def record_decision(body: DecisionIn, _: str = Depends(require_writer)) -> dict:
             status_code=400,
             detail=f"A commercial owner has to confirm the unverified contract term before sign-off. {names}",
         )
-    if bucket.get("comparison", {}).get("plans_differ") and assess_fragility(body.plant_id, body.product_id)["fragile"]:
-        if body.chosen_plan not in {"typed", "proportional"}:
+    fragile = False
+    if bucket.get("comparison", {}).get("plans_differ"):
+        fragile = assess_fragility(body.plant_id, body.product_id)["fragile"]
+        if fragile and body.chosen_plan not in {"typed", "proportional"}:
             raise HTTPException(
                 status_code=400,
                 detail="This recommendation is fragile and the two plans differ. Choose the typed plan or the proportional comparison.",
             )
+    from app.governance import affected_owners, deadline_for, fallback_owners, place_hold, review_required
+
+    owners = affected_owners(bucket["allocations"], scored["allocations"])
+    needs_review = review_required(bucket["decision_review"]["triggers"], changed, fragile, bool(open_terms))
+    if needs_review and not owners:
+        owners = fallback_owners(scored["allocations"])
+    needs_signoff = needs_review and bool(owners)
+    if needs_signoff:
+        status = "awaiting_signoff"
+    else:
+        status = "modified" if changed else "approved"
+    first_due = min((str(line["required_date"]) for line in scored["allocations"]), default=None)
+    decision_deadline = deadline_for(datetime.now(timezone.utc), first_due) if needs_signoff else None
     recommended_payload = {
         "scenario_name": world.get("scenario_name"),
         "allocations": bucket["allocations"],
@@ -591,7 +610,20 @@ def record_decision(body: DecisionIn, _: str = Depends(require_writer)) -> dict:
         )
         decision_id = cursor.lastrowid
         saved = fetch_one(conn, "SELECT * FROM decisions WHERE id = ?", (decision_id,))
-    if plant_mode(body.plant_id) == "pilot":
+    if needs_signoff:
+        schedule = schedule_commitment(world, body.plant_id, body.product_id, targets)
+        place_hold(body.plant_id, body.product_id, schedule)
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE decisions
+                SET deadline = ?, required_signatories_json = ?, hold_json = ?, preparer_role = 'scheduler'
+                WHERE id = ?
+                """,
+                (decision_deadline, json.dumps(owners), json.dumps(schedule), decision_id),
+            )
+            saved = fetch_one(conn, "SELECT * FROM decisions WHERE id = ?", (decision_id,))
+    elif plant_mode(body.plant_id) == "pilot":
         schedule = schedule_commitment(world, body.plant_id, body.product_id, targets)
         write_commitment(body.plant_id, body.product_id, schedule)
         with connect() as conn:
@@ -608,6 +640,10 @@ def _hydrate_decision(row: dict) -> dict:
     raw_actual = row.get("actual_json")
     row["actual"] = json.loads(raw_actual) if raw_actual else None
     row.pop("actual_json", None)
+    raw_signatories = row.get("required_signatories_json")
+    if raw_signatories is not None:
+        row["required_signatories"] = json.loads(raw_signatories or "[]")
+        row.pop("required_signatories_json", None)
     return row
 
 
@@ -665,6 +701,9 @@ def record_actual(decision_id: int, body: ActualIn, _: str = Depends(require_wri
             (json.dumps(payload), body.note.strip(), now, body.username.strip(), decision_id),
         )
         saved = fetch_one(conn, "SELECT * FROM decisions WHERE id = ?", (decision_id,))
+    from app.governance import mark_constraints_bound
+
+    mark_constraints_bound(decision_id)
     return {"decision": _hydrate_decision(saved)}
 
 
@@ -854,7 +893,7 @@ class ExpediteIn(BaseModel):
 
 
 @app.post("/api/plants/{plant_id}/mode")
-def update_mode(plant_id: int, body: ModeIn, _: str = Depends(require_writer)) -> dict:
+def update_mode(plant_id: int, body: ModeIn, _: str = Depends(require_roles("plant_supervisor"))) -> dict:
     try:
         mode = set_plant_mode(plant_id, body.mode)
     except ValueError as exc:
@@ -863,7 +902,7 @@ def update_mode(plant_id: int, body: ModeIn, _: str = Depends(require_writer)) -
 
 
 @app.post("/api/buffer-days")
-def update_buffer(body: BufferIn, _: str = Depends(require_writer)) -> dict:
+def update_buffer(body: BufferIn, _: str = Depends(require_roles("plant_supervisor"))) -> dict:
     return {"buffer_days": set_buffer_days(body.buffer_days)}
 
 
@@ -935,7 +974,7 @@ def list_informal(plant_id: int | None = None, product_id: int | None = None) ->
 
 
 @app.post("/api/inventory-snapshots")
-def record_snapshot(body: SnapshotIn, _: str = Depends(require_writer)) -> dict:
+def record_snapshot(body: SnapshotIn, _: str = Depends(require_roles("plant_supervisor"))) -> dict:
     try:
         as_of = parse_user_date(body.as_of_date)
     except ValueError as exc:
@@ -958,9 +997,15 @@ def record_snapshot(body: SnapshotIn, _: str = Depends(require_writer)) -> dict:
 
 
 @app.post("/api/expedite-decisions")
-def record_expedite(body: ExpediteIn, _: str = Depends(require_writer)) -> dict:
+def record_expedite(body: ExpediteIn, _: str = Depends(require_roles("plant_supervisor"))) -> dict:
+    from app.governance import settings as governance_settings
+
+    decision = body.decision
+    limit = governance_settings()["expedite_limit_rm"]
+    if body.decision == "approve" and body.cost_rm > limit:
+        decision = "awaiting_review"
     estimated = None
-    if body.delivered_in_full and body.on_time and body.penalty_paid_rm is not None and body.decision == "approve":
+    if body.delivered_in_full and body.on_time and body.penalty_paid_rm is not None and decision == "approve":
         estimated = round(max(0.0, body.penalty_would_apply_rm - body.penalty_paid_rm), 2)
     with connect() as conn:
         cursor = conn.execute(
@@ -978,7 +1023,7 @@ def record_expedite(body: ExpediteIn, _: str = Depends(require_writer)) -> dict:
                 body.product_id,
                 body.demand_id,
                 body.customer_or_project.strip(),
-                body.decision,
+                decision,
                 body.emergency_rm_per_m3,
                 body.available_volume_m3,
                 body.cost_rm,
@@ -991,12 +1036,199 @@ def record_expedite(body: ExpediteIn, _: str = Depends(require_writer)) -> dict:
             ),
         )
         row_id = cursor.lastrowid
-    return {"id": row_id, "estimated_avoided_rm": estimated, "label": "estimated avoided"}
+    return {
+        "id": row_id,
+        "estimated_avoided_rm": estimated,
+        "label": "estimated avoided",
+        "status": decision,
+        "expedite_limit_rm": limit,
+        "note": "Above the plant supervisor's limit, the project planner and the commercial owner both have to approve.",
+    }
 
 
 @app.get("/api/measurement")
 def measurement() -> dict:
-    return build_measurement()
+    from app.governance import governance_metrics
+
+    payload = build_measurement()
+    payload["governance"] = governance_metrics()
+    return payload
+
+
+class SignoffIn(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+    plan_choice: Literal["recommended", "proposed"]
+    reason: str = Field(min_length=8)
+
+
+class ConstraintIn(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+    kind: Literal["cap", "reserve", "days"]
+    quantity: float = Field(gt=0)
+    evidence_type: str
+    note: str = ""
+    demand_id: int | None = None
+
+
+class ConsultIn(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+    note: str = Field(min_length=8)
+
+
+class DeclarationIn(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+    demand_id: int
+    declared_rm_per_day: float = Field(ge=0)
+    source: str
+    reason: str = Field(min_length=8)
+
+
+class ProposalIn(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+    key: str
+    proposed_value: str
+    reason: str = Field(min_length=8)
+
+
+class ApprovalIn(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+
+
+def _governance_error(exc: ValueError) -> HTTPException:
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/governance")
+def governance_state() -> dict:
+    from app.governance import governance_metrics, settings as governance_settings
+
+    with connect() as conn:
+        proposals = fetch_all(conn, "SELECT * FROM setting_proposals ORDER BY id DESC")
+        approvals = fetch_all(conn, "SELECT * FROM setting_approvals ORDER BY id")
+        declarations = fetch_all(conn, "SELECT * FROM delay_declarations ORDER BY id DESC")
+        ledger = fetch_all(conn, "SELECT * FROM constraint_ledger ORDER BY id DESC")
+    return {
+        "settings": governance_settings(),
+        "metrics": governance_metrics(),
+        "proposals": proposals,
+        "approvals": approvals,
+        "declarations": declarations,
+        "ledger": ledger,
+        "next_cycle": "2026-11-01",
+        "tie_break": "When the two owners choose different plans and neither records a constraint, the lower expected consequence applies. That makes the model the tie-breaker on purpose.",
+    }
+
+
+@app.post("/api/decisions/{decision_id}/signoff")
+def post_signoff(
+    decision_id: int,
+    body: SignoffIn,
+    role: str = Depends(require_roles("project_planner", "commercial_owner")),
+) -> dict:
+    from app.governance import record_signoff
+
+    try:
+        return record_signoff(decision_id, role, body.username, body.plan_choice, body.reason)
+    except ValueError as exc:
+        raise _governance_error(exc) from exc
+
+
+@app.post("/api/decisions/{decision_id}/constraints")
+def post_constraint(
+    decision_id: int,
+    body: ConstraintIn,
+    role: str = Depends(require_roles("project_planner", "commercial_owner")),
+) -> dict:
+    from app.governance import add_constraint
+
+    try:
+        return add_constraint(decision_id, body.username, role, body.kind, body.quantity, body.evidence_type, body.note, body.demand_id)
+    except ValueError as exc:
+        raise _governance_error(exc) from exc
+
+
+@app.post("/api/decisions/{decision_id}/consultation")
+def post_consultation(
+    decision_id: int,
+    body: ConsultIn,
+    _: str = Depends(require_roles("plant_supervisor")),
+) -> dict:
+    from app.governance import consult
+
+    try:
+        return consult(decision_id, body.username, body.note)
+    except ValueError as exc:
+        raise _governance_error(exc) from exc
+
+
+@app.post("/api/delay-declarations")
+def post_declaration(body: DeclarationIn, _: str = Depends(require_roles("project_planner"))) -> dict:
+    from app.governance import declare_delay
+
+    try:
+        return declare_delay(body.demand_id, body.username, body.declared_rm_per_day, body.source, body.reason)
+    except ValueError as exc:
+        raise _governance_error(exc) from exc
+
+
+@app.post("/api/settings/proposals")
+def post_proposal(body: ProposalIn, role: str = Depends(require_roles("plant_supervisor", "project_planner", "commercial_owner"))) -> dict:
+    from app.governance import propose_setting
+
+    try:
+        return propose_setting(body.key, body.proposed_value, body.reason, body.username, role)
+    except ValueError as exc:
+        raise _governance_error(exc) from exc
+
+
+@app.post("/api/settings/proposals/{proposal_id}/approve")
+def post_approval(
+    proposal_id: int,
+    body: ApprovalIn,
+    role: str = Depends(require_roles("plant_supervisor", "project_planner", "commercial_owner")),
+) -> dict:
+    from app.governance import approve_setting
+
+    try:
+        return approve_setting(proposal_id, role, body.username)
+    except ValueError as exc:
+        raise _governance_error(exc) from exc
+
+
+@app.post("/api/expedite-decisions/{expedite_id}/approve")
+def approve_expedite(
+    expedite_id: int,
+    body: ApprovalIn,
+    role: str = Depends(require_roles("project_planner", "commercial_owner")),
+) -> dict:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect() as conn:
+        row = fetch_one(conn, "SELECT * FROM expedite_decisions WHERE id = ?", (expedite_id,))
+        if row is None:
+            raise HTTPException(status_code=404, detail="Expedite record not found.")
+        if row["decision"] != "awaiting_review":
+            raise HTTPException(status_code=400, detail="This expedite spend is not waiting for the two-party review.")
+        conn.execute(
+            "INSERT INTO expedite_approvals(expedite_id, role, username, created_at) VALUES(?, ?, ?, ?) ON CONFLICT(expedite_id, role) DO NOTHING",
+            (expedite_id, role, body.username.strip(), now),
+        )
+        seats = {item["role"] for item in fetch_all(conn, "SELECT role FROM expedite_approvals WHERE expedite_id = ?", (expedite_id,))}
+        if {"project_planner", "commercial_owner"} <= seats:
+            conn.execute("UPDATE expedite_decisions SET decision = 'approve' WHERE id = ?", (expedite_id,))
+            status = "approve"
+        else:
+            status = "awaiting_review"
+    return {"id": expedite_id, "status": status}
+
+
+@app.get("/api/cron/governance")
+def cron_governance(authorization: str | None = Header(default=None)) -> dict:
+    from app.governance import apply_expired_defaults
+
+    secret = os.getenv("CDI_CRON_SECRET") or os.getenv("CRON_SECRET")
+    if secret and authorization != f"Bearer {secret}":
+        raise HTTPException(status_code=401, detail="Cron secret required.")
+    return apply_expired_defaults()
 
 
 @app.post("/api/admin/reset")

@@ -56,19 +56,19 @@ def test_seed_never_deletes_a_decision(monkeypatch, tmp_path) -> None:
 
 
 def test_writes_require_a_passcode(monkeypatch) -> None:
-    monkeypatch.delenv("CDI_ADMIN_PASSCODE", raising=False)
-    monkeypatch.setenv("CDI_PLANNER_PASSCODE", "planner-demo")
+    monkeypatch.delenv("CDI_PASSCODE_ADMIN", raising=False)
+    monkeypatch.delenv("CDI_PASSCODE_SCHEDULER", raising=False)
     with pytest.raises(HTTPException) as missing:
         require_writer(None, None)
     assert missing.value.status_code == 401
-    with pytest.raises(HTTPException) as unset:
-        require_admin(None, None)
-    assert unset.value.status_code == 403
-    monkeypatch.setenv("CDI_ADMIN_PASSCODE", "test-admin")
+    with pytest.raises(HTTPException) as viewer:
+        require_admin("viewer", "")
+    assert viewer.value.status_code == 403
+    monkeypatch.setenv("CDI_PASSCODE_ADMIN", "test-admin")
     with pytest.raises(HTTPException) as wrong:
-        require_admin("planner", "planner-demo")
-    assert wrong.value.status_code == 401
-    assert require_writer("planner", "planner-demo") == "planner"
+        require_admin("scheduler", "scheduler-demo")
+    assert wrong.value.status_code == 403
+    assert require_writer("scheduler", "scheduler-demo") == "scheduler"
     assert require_admin("admin", "test-admin") == "admin"
 
 
@@ -285,10 +285,10 @@ def test_failure_illustration_fires_and_admin_reset_is_protected(monkeypatch, tm
 
 
 def test_planner_hint_disappears_when_the_passcode_is_configured(monkeypatch) -> None:
-    monkeypatch.delenv("CDI_PLANNER_PASSCODE", raising=False)
-    assert auth_status()["planner_hint"] == "planner-demo"
-    monkeypatch.setenv("CDI_PLANNER_PASSCODE", "set-on-the-server")
-    assert auth_status()["planner_hint"] is None
+    monkeypatch.delenv("CDI_PASSCODE_SCHEDULER", raising=False)
+    assert auth_status()["hints"]["scheduler"] == "scheduler-demo"
+    monkeypatch.setenv("CDI_PASSCODE_SCHEDULER", "set-on-the-server")
+    assert "scheduler" not in auth_status()["hints"]
 
 
 def test_illustration_gap_is_the_best_simple_rule() -> None:

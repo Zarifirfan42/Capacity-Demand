@@ -83,7 +83,19 @@ def main() -> None:
     print("Value protected vs earliest", result["totals"]["value_protected_vs_earliest_rm"])
     print("Value protected vs best rule", result["totals"]["value_protected_vs_best_rule_rm"])
     print("Best rules", result["totals"]["best_rule_by_bucket"])
+    from app.db import connect
+    from app.governance import settings
+
+    values = settings()
+    with connect() as conn:
+        defaulted = conn.execute("SELECT COUNT(*) AS n FROM decisions WHERE status = 'defaulted'").fetchone()["n"]
+    assert values["review_programme_days"] == 2
+    assert values["review_expected_rm"] == 25000
+    assert values["review_penalty_rm"] == 20000
+    assert int(defaulted) == 0
     print("Plant modes", {plant["name"]: plant_mode(plant["id"]) for plant in result["plants"]} if "plants" in result else "shadow by default")
+    print("Governance opening lines", values["review_programme_days"], values["review_expected_rm"], values["review_penalty_rm"])
+    print("Defaulted decisions on a fresh seed", int(defaulted))
     print("SELF-CHECK PASSED")
 
 

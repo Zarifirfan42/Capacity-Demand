@@ -427,15 +427,21 @@ def review_case(
     internal_delay: bool,
     external_penalty: bool,
     fragile: bool = False,
+    programme_line: float | None = None,
+    expected_line: float | None = None,
+    penalty_line: float | None = None,
 ) -> dict:
     """Who reviews. Thresholds are labelled assumptions, not a head-office policy."""
+    programme_line = REVIEW_PROGRAMME_DAYS if programme_line is None else programme_line
+    expected_line = REVIEW_EXPECTED_CONSEQUENCE_RM if expected_line is None else expected_line
+    penalty_line = REVIEW_PENALTY_RM if penalty_line is None else penalty_line
     triggers = []
-    if programme_days >= REVIEW_PROGRAMME_DAYS:
-        triggers.append(f"Programme days at risk are {programme_days:g}, at or above the assumed review line of {REVIEW_PROGRAMME_DAYS:g}.")
-    if expected_rm >= REVIEW_EXPECTED_CONSEQUENCE_RM:
-        triggers.append(f"Expected consequence is RM{expected_rm:,.0f}, at or above the assumed review line of RM{REVIEW_EXPECTED_CONSEQUENCE_RM:,.0f}.")
-    if penalty_rm >= REVIEW_PENALTY_RM:
-        triggers.append(f"Contractual penalty at risk is RM{penalty_rm:,.0f}, at or above the assumed review line of RM{REVIEW_PENALTY_RM:,.0f}.")
+    if programme_days >= programme_line:
+        triggers.append(f"Programme days at risk are {programme_days:g}, at or above the assumed review line of {programme_line:g}.")
+    if expected_rm >= expected_line:
+        triggers.append(f"Expected consequence is RM{expected_rm:,.0f}, at or above the assumed review line of RM{expected_line:,.0f}.")
+    if penalty_rm >= penalty_line:
+        triggers.append(f"Contractual penalty at risk is RM{penalty_rm:,.0f}, at or above the assumed review line of RM{penalty_line:,.0f}.")
     cross = internal_delay and external_penalty
     if cross:
         triggers.append("The same plant and product carries both an internal programme delay and an external penalty.")

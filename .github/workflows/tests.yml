@@ -16,7 +16,7 @@ jobs:
         run: pip install -r backend/requirements.txt pytest
       - name: Run pytest
         working-directory: backend
-        run: python -m pytest tests/test_allocation.py tests/test_phase4.py -q --disable-warnings
+        run: python -m pytest tests/test_allocation.py tests/test_phase4.py tests/test_governance.py -q --disable-warnings
       - name: Run self-check
         working-directory: backend
         run: python -m app.selfcheck

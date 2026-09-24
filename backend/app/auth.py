@@ -1,4 +1,4 @@
-"""Shared demo passcodes. Reads stay open. Writes and the demo reset do not."""
+"""Per-role demo secrets. Reads stay open. A viewer who writes is refused with 403."""
 
 from __future__ import annotations
 
@@ -6,44 +6,57 @@ import os
 
 from fastapi import Header, HTTPException
 
+ROLE_ENV = {
+    "scheduler": "CDI_PASSCODE_SCHEDULER",
+    "plant_supervisor": "CDI_PASSCODE_PLANT_SUPERVISOR",
+    "project_planner": "CDI_PASSCODE_PROJECT_PLANNER",
+    "commercial_owner": "CDI_PASSCODE_COMMERCIAL_OWNER",
+    "admin": "CDI_PASSCODE_ADMIN",
+}
+LOCAL_DEFAULTS = {
+    "scheduler": "scheduler-demo",
+    "plant_supervisor": "supervisor-demo",
+    "project_planner": "planner-demo",
+    "commercial_owner": "commercial-demo",
+    "admin": "admin-demo",
+}
+WRITE_ROLES = list(ROLE_ENV)
 
-def planner_passcode() -> str:
-    return os.getenv("CDI_PLANNER_PASSCODE", "planner-demo")
 
-
-def admin_passcode() -> str | None:
-    return os.getenv("CDI_ADMIN_PASSCODE") or None
+def passcode_for(role: str) -> str:
+    env = ROLE_ENV.get(role)
+    if env is None:
+        return ""
+    return os.getenv(env, LOCAL_DEFAULTS[role])
 
 
 def auth_status() -> dict:
-    using_local_default = "CDI_PLANNER_PASSCODE" not in os.environ
+    hints = {role: LOCAL_DEFAULTS[role] for role, env in ROLE_ENV.items() if env not in os.environ}
     return {
-        "planner_hint": "planner-demo" if using_local_default else None,
-        "reset_available": admin_passcode() is not None,
-        "roles": ["viewer", "planner", "admin"],
+        "hints": hints,
+        "roles": ["viewer", *WRITE_ROLES],
+        "identity_note": "A real deployment would use the company identity provider, for example Microsoft 365 sign-in. These per-role secrets are the demo stand-in.",
     }
 
 
-def require_writer(
-    x_demo_role: str | None = Header(default=None),
-    x_demo_passcode: str | None = Header(default=None),
-) -> str:
-    role = (x_demo_role or "").strip().lower()
-    code = x_demo_passcode or ""
-    if role == "admin" and admin_passcode() and code == admin_passcode():
-        return "admin"
-    if role == "planner" and code == planner_passcode():
-        return "planner"
-    raise HTTPException(status_code=401, detail="Enter the planner or admin passcode before recording.")
+def require_roles(*allowed: str):
+    def checker(
+        x_demo_role: str | None = Header(default=None),
+        x_demo_passcode: str | None = Header(default=None),
+    ) -> str:
+        role = (x_demo_role or "").strip().lower()
+        if role == "viewer":
+            raise HTTPException(status_code=403, detail="A viewer can read. This action needs a role that is allowed to write.")
+        if role not in ROLE_ENV:
+            raise HTTPException(status_code=401, detail="Enter a role and its passcode before recording.")
+        if (x_demo_passcode or "") != passcode_for(role):
+            raise HTTPException(status_code=401, detail="The passcode does not match that role.")
+        if role not in allowed:
+            raise HTTPException(status_code=403, detail=f"This action is for {', '.join(allowed)}.")
+        return role
+
+    return checker
 
 
-def require_admin(
-    x_demo_role: str | None = Header(default=None),
-    x_demo_passcode: str | None = Header(default=None),
-) -> str:
-    if admin_passcode() is None:
-        raise HTTPException(status_code=403, detail="Set CDI_ADMIN_PASSCODE before the demo can be reset.")
-    role = (x_demo_role or "").strip().lower()
-    if role == "admin" and (x_demo_passcode or "") == admin_passcode():
-        return "admin"
-    raise HTTPException(status_code=401, detail="Resetting the demo requires the admin passcode.")
+require_writer = require_roles("scheduler")
+require_admin = require_roles("admin")

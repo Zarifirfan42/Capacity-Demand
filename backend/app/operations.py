@@ -81,6 +81,8 @@ def open_decision_view(plant_id: int, product_id: int) -> dict | None:
         "username": row["username"],
         "created_at": row["created_at"],
         "status": row["status"],
+        "deadline": row.get("deadline"),
+        "required_signatories": json.loads(row.get("required_signatories_json") or "[]"),
         "locked": bool(row.get("actual_json")),
         "lines": lines,
     }

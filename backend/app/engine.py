@@ -118,7 +118,9 @@ def load_world() -> dict:
     for row in calendar:
         committed = float(row.get("committed_production") or 0.0)
         row["committed_production"] = committed
-        row["available_capacity"] = max(0.0, float(row["daily_capacity"]) - float(row["planned_production"]) - committed)
+        held = float(row.get("held_production") or 0.0)
+        row["held_production"] = held
+        row["available_capacity"] = max(0.0, float(row["daily_capacity"]) - float(row["planned_production"]) - committed - held)
     _clear_unstockable(products, inventory)
     world = {
         "plants": plants,
@@ -129,8 +131,10 @@ def load_world() -> dict:
         "scenario_notes": [],
     }
     from app.operations import apply_open_commitments
+    from app.governance import apply_declarations
 
     apply_open_commitments(world)
+    apply_declarations(world)
     return world
 
 
@@ -144,6 +148,17 @@ def _open_decision(plant_id: int, product_id: int):
     from app.operations import open_decision_view
 
     return open_decision_view(plant_id, product_id)
+
+
+def _review_lines() -> dict[str, float]:
+    from app.governance import settings
+
+    values = settings()
+    return {
+        "review_programme_days": values["review_programme_days"],
+        "review_expected_rm": values["review_expected_rm"],
+        "review_penalty_rm": values["review_penalty_rm"],
+    }
 
 
 def _plant(world: dict, plant_id: int) -> dict:
@@ -514,6 +529,13 @@ def _solve_lp(
             span = max(requested - threshold, 0.0)
             problem += parent_unserved <= threshold + span * binary, f"day_trigger_{parent_id}"
             lump_terms.append(delay_total * full_miss_delay_weight(parent) * binary)
+        cap_m3 = parent.get("allocation_cap_m3")
+        if cap_m3 is not None:
+            problem += requested - parent_unserved <= float(cap_m3) + 1e-4, f"alloc_cap_{parent_id}"
+        day_cap = parent.get("max_programme_days")
+        delay_days = float(parent.get("delay_days_if_unserved") or 0)
+        if day_cap is not None and delay_days > TOL and requested > TOL:
+            problem += parent_unserved <= requested * float(day_cap) / delay_days + 1e-4, f"day_cap_{parent_id}"
         minimum = float(parent.get("minimum_useful_delivery_m3") or 0.0)
         if minimum > TOL and minimum < requested - TOL:
             useful = pulp.LpVariable(f"useful_{parent_id}", cat="Binary")
@@ -744,6 +766,8 @@ def _line_view(demand: dict, slot: dict, rank: int, emergency: float, emergency_
         "demand_code": demand["demand_code"],
         "demand_type": demand["demand_type"],
         "customer_or_project": demand["customer_or_project"],
+        "owner_name": demand.get("owner_name") or "",
+        "owner_role": demand.get("owner_role") or "",
         "customer_type": demand["customer_type"],
         "required_date": demand["required_date"],
         "requested_quantity": round_m3(demand["quantity"]),
@@ -1606,6 +1630,9 @@ def solve_bucket(
             totals["penalty_at_risk_rm"],
             any(line["demand_type"] == "Internal" and line["programme_days"] > 0.05 for line in lines),
             any(line["demand_type"] == "External" and line["penalty_at_risk_rm"] > 1 for line in lines),
+            programme_line=_review_lines()["review_programme_days"],
+            expected_line=_review_lines()["review_expected_rm"],
+            penalty_line=_review_lines()["review_penalty_rm"],
         ),
         "inventory_projection": {
             "opening_on_hand_m3": round_m3(inventory["on_hand"]),
@@ -2196,6 +2223,7 @@ def capacity_view(plant_id: int, product_id: int) -> dict:
                 "daily_capacity_m3": row["daily_capacity"],
                 "planned_production_m3": row["planned_production"],
                 "committed_production_m3": round_m3(float(row.get("committed_production") or 0.0)),
+                "held_production_m3": round_m3(float(row.get("held_production") or 0.0)),
                 "available_capacity_m3": row["available_capacity"],
                 "internal_demand_due_m3": round_m3(internal),
                 "external_demand_due_m3": round_m3(external),

@@ -559,3 +559,6 @@ def seed(force: bool = False) -> None:
         set_meta(conn, "seed_version", SEED_VERSION)
         set_meta(conn, "horizon_start", HORIZON_START)
         set_meta(conn, "horizon_end", (START + timedelta(days=HORIZON_DAYS - 1)).isoformat())
+        from app.governance import ensure_owners
+
+        ensure_owners(conn)

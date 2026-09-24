@@ -259,6 +259,11 @@ def init_db() -> None:
         _ensure_product_columns(conn)
         _ensure_demand_columns(conn)
         _ensure_calendar_columns(conn)
+        _ensure_governance_tables(conn)
+        from app.governance import ensure_owners, ensure_settings
+
+        ensure_owners(conn)
+        ensure_settings(conn)
 
 
 def _ensure_decision_columns(conn: sqlite3.Connection) -> None:
@@ -274,6 +279,11 @@ def _ensure_decision_columns(conn: sqlite3.Connection) -> None:
         "terms_confirmed": "INTEGER NOT NULL DEFAULT 0",
         "committed_json": "TEXT",
         "replaced_by": "INTEGER",
+        "deadline": "TEXT",
+        "defaulted_at": "TEXT",
+        "required_signatories_json": "TEXT NOT NULL DEFAULT '[]'",
+        "hold_json": "TEXT",
+        "preparer_role": "TEXT NOT NULL DEFAULT ''",
     }
     for name, declaration in additions.items():
         if name not in present:
@@ -290,6 +300,8 @@ def _ensure_demand_columns(conn: sqlite3.Connection) -> None:
         "types_unverified": "INTEGER NOT NULL DEFAULT 1",
         "delay_type_unverified": "INTEGER NOT NULL DEFAULT 1",
         "minimum_useful_delivery_m3": "REAL NOT NULL DEFAULT 0",
+        "owner_name": "TEXT NOT NULL DEFAULT ''",
+        "owner_role": "TEXT NOT NULL DEFAULT ''",
     }
     for name, declaration in additions.items():
         if name not in present:
@@ -300,12 +312,100 @@ def _ensure_calendar_columns(conn: sqlite3.Connection) -> None:
     present = {row[1] for row in conn.execute("PRAGMA table_info(capacity_calendar)").fetchall()}
     if "committed_production" not in present:
         conn.execute("ALTER TABLE capacity_calendar ADD COLUMN committed_production REAL NOT NULL DEFAULT 0")
+    if "held_production" not in present:
+        conn.execute("ALTER TABLE capacity_calendar ADD COLUMN held_production REAL NOT NULL DEFAULT 0")
 
 
 def _ensure_product_columns(conn: sqlite3.Connection) -> None:
     present = {row[1] for row in conn.execute("PRAGMA table_info(products)").fetchall()}
     if "stockable" not in present:
         conn.execute("ALTER TABLE products ADD COLUMN stockable INTEGER NOT NULL DEFAULT 1")
+
+
+def _ensure_governance_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS decision_signoffs (
+            id INTEGER PRIMARY KEY,
+            decision_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            username TEXT NOT NULL,
+            plan_choice TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS decision_constraints (
+            id INTEGER PRIMARY KEY,
+            decision_id INTEGER NOT NULL,
+            demand_id INTEGER,
+            username TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            quantity REAL NOT NULL,
+            evidence_type TEXT NOT NULL,
+            note TEXT NOT NULL,
+            cost_rm REAL NOT NULL,
+            bound INTEGER,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS constraint_ledger (
+            id INTEGER PRIMARY KEY,
+            decision_id INTEGER NOT NULL,
+            constraint_id INTEGER NOT NULL,
+            owner_name TEXT NOT NULL,
+            cost_rm REAL NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS expedite_approvals (
+            id INTEGER PRIMARY KEY,
+            expedite_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            username TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(expedite_id, role)
+        );
+        CREATE TABLE IF NOT EXISTS consultations (
+            id INTEGER PRIMARY KEY,
+            decision_id INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            note TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS delay_declarations (
+            id INTEGER PRIMARY KEY,
+            demand_id INTEGER NOT NULL,
+            project_name TEXT NOT NULL,
+            declared_rm_per_day REAL NOT NULL,
+            source TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            username TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            credibility REAL NOT NULL,
+            effective_rm_per_day REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS setting_proposals (
+            id INTEGER PRIMARY KEY,
+            key TEXT NOT NULL,
+            proposed_value TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            proposed_by TEXT NOT NULL,
+            proposer_role TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            effective_on TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS setting_approvals (
+            id INTEGER PRIMARY KEY,
+            proposal_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            username TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
@@ -323,6 +423,15 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 def reset_data(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
+        DELETE FROM expedite_approvals;
+        DELETE FROM setting_approvals;
+        DELETE FROM setting_proposals;
+        DELETE FROM delay_declarations;
+        DELETE FROM consultations;
+        DELETE FROM constraint_ledger;
+        DELETE FROM decision_constraints;
+        DELETE FROM decision_signoffs;
+        DELETE FROM settings;
         DELETE FROM decision_replacements;
         DELETE FROM expedite_decisions;
         DELETE FROM inventory_snapshots;
