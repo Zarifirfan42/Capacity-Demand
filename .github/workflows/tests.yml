@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend
+        run: pip install -r backend/requirements.txt pytest
+      - name: Run pytest
+        working-directory: backend
+        run: python -m pytest tests/test_allocation.py tests/test_phase4.py -q --disable-warnings
+      - name: Run self-check
+        working-directory: backend
+        run: python -m app.selfcheck
