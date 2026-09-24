@@ -31,6 +31,8 @@ MONTHS = {
     "september": 9,
     "oct": 10,
     "october": 10,
+    "okt": 10,
+    "oktober": 10,
     "nov": 11,
     "november": 11,
     "dec": 12,
@@ -85,7 +87,7 @@ def _date(text: str) -> str | None:
 
 
 def _quantity(text: str) -> float | None:
-    match = re.search(r"(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*m(?:3|³)", text, re.I)
+    match = re.search(r"(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(?:m(?:3|³)|kubik)", text, re.I)
     if not match:
         return None
     return float(match.group(1).replace(",", ""))
@@ -114,7 +116,7 @@ def _confidence(text: str) -> tuple[str, str, str]:
         return "Forecast", "Forecast", "Confidence set to Forecast because the text says forecast."
     if "probable" in lowered or "not a firm" in lowered:
         return "Probable", "Open", "Confidence set to Probable because the release is not firm."
-    if any(phrase in lowered for phrase in ("confirmed", "purchase order", " po", "firm")):
+    if re.search(r"\b(confirmed|purchase order|po|firm)\b", lowered):
         return "Confirmed", "Firm", "Confidence set to Confirmed because the text refers to a firm order or PO."
     return "Probable", "Open", "Confidence set to Probable. The text does not say confirmed, forecast, or probable explicitly."
 
@@ -215,20 +217,10 @@ def extract_demand(text: str, plants: list[dict], products: list[dict], source: 
         warnings.append(f"Required date {required} is outside the prototype horizon {HORIZON_START} to {HORIZON_END}.")
     else:
         steps.append(f"Required date read as {required}.")
-    margin = _money(cleaned, r"margin")
-    penalty = _money(cleaned, r"penalt")
-    if margin is None:
-        margin = 0.0
-        warnings.append("Contribution margin was not found and is set to RM0. Edit it if you know the value.")
-    else:
-        steps.append(f"Contribution margin read as RM{margin:,.0f}.")
-    if penalty is None:
-        penalty = 0.0
-    else:
-        steps.append(f"Contractual penalty read as RM{penalty:,.0f}.")
-    delay_days, delay_cost = _delay(cleaned)
-    if delay_days:
-        steps.append(f"Programme delay read as {delay_days:g} days at RM{delay_cost:,.0f} per day.")
+    warnings.append("Margin, penalty, and delay cost are typed by a person. They are not read from the message.")
+    margin = 0.0
+    penalty = 0.0
+    delay_days, delay_cost = 0.0, 0.0
     customer = _customer(cleaned, demand_type)
     type_match = re.search(r"customer type\s*:\s*(.+)", cleaned, re.I)
     if type_match:
@@ -265,10 +257,9 @@ def extract_demand(text: str, plants: list[dict], products: list[dict], source: 
     }
     signals = [
         quantity is not None,
-        required is not None,
+        required is not None and HORIZON_START <= required <= HORIZON_END,
         plant is not None,
         product is not None,
-        margin > 0,
         bool(customer) and not customer.startswith("Unnamed"),
     ]
     extraction_confidence = round(sum(1 for signal in signals if signal) / len(signals), 2)

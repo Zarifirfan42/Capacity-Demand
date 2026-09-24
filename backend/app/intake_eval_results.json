@@ -1,0 +1,99 @@
+{
+  "generated_on": "2026-09-24",
+  "eval_file": "intake_eval.json",
+  "text_cases": 14,
+  "image_cases": 3,
+  "regex": {
+    "status": "measured",
+    "per_field_accuracy": {
+      "intent": 1.0,
+      "customer_contains": 0.923,
+      "demand_type": 1.0,
+      "plant": 1.0,
+      "product": 1.0,
+      "quantity": 1.0,
+      "required_date": 1.0,
+      "commercial_blank": 1.0,
+      "draft_count": 0.0,
+      "absent_from_model": 1.0
+    },
+    "overall": 0.98,
+    "checks": 100,
+    "failures": [
+      {
+        "id": "two-orders",
+        "field": "draft_count",
+        "expected": 2,
+        "actual": 1
+      },
+      {
+        "id": "change-sunway",
+        "field": "customer_contains",
+        "expected": "Sunway",
+        "actual": ""
+      }
+    ],
+    "confidence_calibration": {
+      "score": "regex extraction_confidence. This is a count of filled fields, not a model probability.",
+      "threshold": 0.7,
+      "n_at_or_above": 10,
+      "fully_correct_at_or_above": 8,
+      "reliability": 0.8,
+      "note": "The 0.7 cut-off was checked on this regex score. A live model threshold was not calibrated."
+    }
+  },
+  "llm": {
+    "status": "not_run",
+    "reason": "ANTHROPIC_API_KEY was absent when this file was written. CI reads this file and does not call the API.",
+    "model": null,
+    "date": "2026-09-24",
+    "per_field_accuracy": null,
+    "failures": [],
+    "beats_regex": null
+  },
+  "vision": {
+    "status": "not_run",
+    "reason": "No API key, and CDI_INTAKE_VISION is off. The three synthetic images stay in the set.",
+    "images": [
+      {
+        "id": "typed-do",
+        "file": "fixtures/intake/typed-do.png",
+        "kind": "typed delivery order",
+        "expect": {
+          "customer_contains": "Gamuda",
+          "plant": "Shah Alam Works",
+          "product": "G40",
+          "quantity": 90,
+          "required_date": "2026-10-09",
+          "confidence_level": "Confirmed"
+        }
+      },
+      {
+        "id": "skewed-do",
+        "file": "fixtures/intake/skewed-do.png",
+        "kind": "skewed photo",
+        "expect": {
+          "customer_contains": "Sunway",
+          "plant": "Pasir Gudang Works",
+          "product": "G50",
+          "quantity": 40,
+          "required_date": "2026-10-16",
+          "confidence_level": "Confirmed"
+        }
+      },
+      {
+        "id": "handwritten-note",
+        "file": "fixtures/intake/handwritten-note.png",
+        "kind": "handwritten-style note",
+        "expect": {
+          "customer_contains": "Elmina",
+          "demand_type": "Internal",
+          "plant": "Shah Alam Works",
+          "product": "PCS",
+          "quantity": 25,
+          "required_date": "2026-10-18"
+        }
+      }
+    ]
+  }
+}

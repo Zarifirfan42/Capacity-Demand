@@ -260,6 +260,9 @@ def init_db() -> None:
         _ensure_demand_columns(conn)
         _ensure_calendar_columns(conn)
         _ensure_governance_tables(conn)
+        from app.intake import ensure_tables
+
+        ensure_tables(conn)
         from app.governance import ensure_owners, ensure_settings
 
         ensure_owners(conn)
@@ -423,6 +426,8 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 def reset_data(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
+        DELETE FROM intake_calls;
+        DELETE FROM intake_events;
         DELETE FROM expedite_approvals;
         DELETE FROM setting_approvals;
         DELETE FROM setting_proposals;
