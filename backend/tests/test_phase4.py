@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from app.auth import require_admin, require_writer
+from app.auth import auth_status, require_admin, require_writer
 from app.db import connect, get_meta
 from app.engine import _schedule_deadline, load_world, solve_bucket
 from app.main import (
@@ -23,7 +23,7 @@ from app.main import (
     record_informal,
     record_snapshot,
 )
-from app.measurement import live_metrics, score_illustration
+from app.measurement import illustrate_failure, live_metrics, score_illustration, weeks_from_solves
 from app.operations import set_buffer_days, set_plant_mode, validate_actuals
 from app.seed import seed
 
@@ -282,3 +282,66 @@ def test_failure_illustration_fires_and_admin_reset_is_protected(monkeypatch, tm
         plants = conn.execute("SELECT COUNT(*) AS n FROM plants").fetchone()["n"]
     assert int(count) == 0
     assert int(plants) > 0
+
+
+def test_planner_hint_disappears_when_the_passcode_is_configured(monkeypatch) -> None:
+    monkeypatch.delenv("CDI_PLANNER_PASSCODE", raising=False)
+    assert auth_status()["planner_hint"] == "planner-demo"
+    monkeypatch.setenv("CDI_PLANNER_PASSCODE", "set-on-the-server")
+    assert auth_status()["planner_hint"] is None
+
+
+def test_illustration_gap_is_the_best_simple_rule() -> None:
+    quiet = {"recommended_rm": 100000, "best_rule_gap_rm": 0, "constrained_days": 2, "programme_days": 1}
+    noisy = {"recommended_rm": 100000, "best_rule_gap_rm": 3300, "constrained_days": 2, "programme_days": 1}
+    solved = [quiet] * 8 + [noisy] * 4
+    scored = score_illustration(weeks_from_solves(solved))
+    assert scored["paired_mean_gap_rm"] == 1100
+    assert scored["failure_rule_fired"] is None
+    failed = score_illustration(illustrate_failure(weeks_from_solves(solved)))
+    assert failed["failure_rule_fired"]
+
+
+def test_decision_and_actual_survive_app_restart(monkeypatch, tmp_path) -> None:
+    _db(monkeypatch, tmp_path)
+    world = load_world()
+    bucket = solve_bucket(world, 2, 3, include_comparison=False, include_expedite=False)
+    allocations = [
+        AllocationLineIn(demand_id=line["demand_id"], allocated_quantity=line["allocated_quantity"])
+        for line in bucket["allocations"]
+    ]
+    saved = record_decision(
+        DecisionIn(
+            username="Planner",
+            plant_id=2,
+            product_id=3,
+            override_reason="Accepted the recommendation.",
+            allocations=allocations,
+            terms_confirmed=True,
+            chosen_plan="typed",
+        ),
+        "planner",
+    )
+    decision_id = saved["decision"]["id"]
+    lines = [
+        ActualLineIn(
+            demand_id=line["demand_id"],
+            delivered_m3=line["requested_quantity"],
+            actual_delivery_date="2026-10-20",
+            programme_days_lost=0,
+            penalty_paid_rm=0,
+        )
+        for line in bucket["allocations"]
+    ]
+    record_actual(decision_id, ActualIn(username="Planner", lines=lines), "planner")
+    import app.main as main_module
+
+    main_module._ready = False
+    main_module._startup()
+    with connect() as conn:
+        row = conn.execute("SELECT actual_json, status FROM decisions WHERE id = ?", (decision_id,)).fetchone()
+        count = conn.execute("SELECT COUNT(*) AS n FROM decisions").fetchone()["n"]
+    assert int(count) == 1
+    assert row["actual_json"]
+    assert "delivered_m3" in row["actual_json"]
+    assert row["status"] != "replaced"
