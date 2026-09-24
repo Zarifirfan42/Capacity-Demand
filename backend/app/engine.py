@@ -18,6 +18,8 @@ from app.economics import (
     CRITICALITY_MULT,
     HORIZON_END,
     HORIZON_START,
+    READY_MIX_CODES,
+    SHARED_READY_MIX_BATCHING,
     consequence_for_unserved,
     expedite_advice,
     line_economics,
@@ -68,10 +70,7 @@ def load_world() -> dict:
         demands = fetch_all(conn, "SELECT * FROM demands ORDER BY required_date, id")
     for row in calendar:
         row["available_capacity"] = max(0.0, float(row["daily_capacity"]) - float(row["planned_production"]))
-    for row in inventory:
-        row["on_hand"] = float(row["on_hand"])
-        row["safety_stock"] = float(row["safety_stock"])
-        row["usable"] = max(0.0, row["on_hand"] - row["safety_stock"])
+    _clear_unstockable(products, inventory)
     return {
         "plants": plants,
         "products": products,
@@ -183,7 +182,130 @@ def apply_scenario(world: dict, scenario: dict | None) -> dict:
             notes.append(f"{name}: {label} confidence set to {demand['confidence_level']}.")
     world["scenario_name"] = name
     world["scenario_notes"] = notes
+    if "shared_ready_mix_batching" in scenario:
+        world["shared_ready_mix_batching"] = bool(scenario["shared_ready_mix_batching"])
+    _clear_unstockable(world["products"], world["inventory"])
     return world
+
+
+def product_is_stockable(product: dict) -> bool:
+    if product.get("stockable") is not None:
+        return bool(product["stockable"])
+    return product.get("code") not in READY_MIX_CODES
+
+
+def _clear_unstockable(products: list[dict], inventory: list[dict]) -> None:
+    stockable = {int(product["id"]): product_is_stockable(product) for product in products}
+    for row in inventory:
+        row["on_hand"] = float(row["on_hand"])
+        row["safety_stock"] = float(row["safety_stock"])
+        if not stockable.get(int(row["product_id"]), True):
+            row["on_hand"] = 0.0
+            row["safety_stock"] = 0.0
+        row["usable"] = max(0.0, row["on_hand"] - row["safety_stock"])
+
+
+def expand_tranches(demand: dict) -> list[dict]:
+    """Split one order into a confirmed tranche and an unconfirmed remainder.
+
+    The confirmed cubic metres use the Confirmed weight. The remainder uses
+    Forecast when the line is a forecast, and Probable otherwise. Money and
+    programme days are split in proportion to quantity so the two tranches
+    add back to the order.
+    """
+    requested = float(demand["requested_quantity"])
+    confirmed = min(max(float(demand.get("confirmed_quantity") or 0.0), 0.0), requested)
+    remainder = requested - confirmed
+    status = str(demand.get("demand_status") or "").strip().lower()
+    parent_level = str(demand.get("confidence_level") or "Confirmed")
+    remainder_level = "Forecast" if parent_level == "Forecast" or status == "forecast" else "Probable"
+    parent_id = int(demand["id"])
+    slices: list[tuple[float, str, str, int]] = []
+    if confirmed > TOL and remainder > TOL:
+        slices.append((confirmed, "Confirmed", "confirmed", parent_id))
+        slices.append((remainder, remainder_level, "unconfirmed", -parent_id))
+    elif confirmed > TOL:
+        slices.append((confirmed, "Confirmed", "confirmed", parent_id))
+    elif remainder > TOL:
+        slices.append((remainder, remainder_level, "unconfirmed", parent_id))
+    rows = []
+    for qty, level, kind, tranche_id in slices:
+        fraction = qty / requested if requested else 0.0
+        row = dict(demand)
+        row["id"] = tranche_id
+        row["parent_id"] = parent_id
+        row["tranche"] = kind
+        row["requested_quantity"] = qty
+        row["confirmed_quantity"] = qty if kind == "confirmed" else 0.0
+        row["confidence_level"] = level
+        row["contribution_margin"] = float(demand["contribution_margin"]) * fraction
+        row["contractual_penalty"] = float(demand["contractual_penalty"]) * fraction
+        row["delay_days_if_unserved"] = float(demand["delay_days_if_unserved"]) * fraction
+        rows.append(row)
+    return rows
+
+
+def _collapse_plan(parents: list[dict], tranches: list[dict], tranche_plan: dict[int, dict]) -> dict[int, dict]:
+    by_parent: dict[int, list[dict]] = {}
+    for tranche in tranches:
+        by_parent.setdefault(int(tranche["parent_id"]), []).append(tranche)
+    plan: dict[int, dict] = {}
+    for parent in parents:
+        parent_id = int(parent["id"])
+        parts = by_parent.get(parent_id, [])
+        allocated = 0.0
+        from_inv = 0.0
+        from_prod = 0.0
+        by_day: list[dict] = []
+        money = {
+            "margin_at_risk_rm": 0.0,
+            "penalty_at_risk_rm": 0.0,
+            "delay_cost_incurred_rm": 0.0,
+            "gross_consequence_rm": 0.0,
+            "expected_consequence_rm": 0.0,
+            "programme_days": 0.0,
+            "consequence_avoided_gross_rm": 0.0,
+        }
+        notes = []
+        for part in parts:
+            slot = tranche_plan.get(int(part["id"]), {"allocated": 0.0, "unserved": part["quantity"], "from_inventory": 0.0, "from_production": 0.0, "by_day": []})
+            allocated += float(slot["allocated"])
+            from_inv += float(slot["from_inventory"])
+            from_prod += float(slot["from_production"])
+            by_day.extend(slot.get("by_day") or [])
+            impact = consequence_for_unserved(part, float(slot["unserved"]))
+            for key in money:
+                money[key] += float(impact[key])
+            weight = int(round(float(part["confidence_factor"]) * 100))
+            notes.append(
+                f"{_m3(part['quantity'])} {part['tranche']} at {weight}% ({part['confidence_level']})"
+            )
+        qty = float(parent["quantity"])
+        allocated = _snap(allocated, qty)
+        plan[parent_id] = {
+            "allocated": allocated,
+            "unserved": round_m3(qty - allocated),
+            "from_inventory": round_m3(from_inv),
+            "from_production": round_m3(from_prod),
+            "by_day": by_day,
+            "impact_override": {key: round_rm(value) if key != "programme_days" else round(value, 2) for key, value in money.items()},
+            "tranche_note": (
+                "Confirmed quantity and the unconfirmed remainder are separate tranches. " + "; ".join(notes) + "."
+                if len(parts) > 1
+                else ""
+            ),
+        }
+    return plan
+
+
+def _plans_for(raw_demands: list[dict], days: list[str], cap: dict[str, float], usable: float) -> dict[str, dict[int, dict]]:
+    parents = _prepare_demands(raw_demands)
+    tranches = _prepare_demands([row for demand in raw_demands for row in expand_tranches(demand)])
+    optimised = _collapse_plan(parents, tranches, _solve_lp(tranches, days, cap, usable))
+    policies = {"optimised": optimised}
+    for name in ("internal", "external", "earliest", "practice"):
+        policies[name] = _collapse_plan(parents, tranches, _greedy(tranches, days, cap, usable, name))
+    return policies
 
 
 def _prepare_demands(demands: list[dict]) -> list[dict]:
@@ -261,25 +383,26 @@ def _solve_lp(demands: list[dict], days: list[str], cap: dict[str, float], usabl
     return plan
 
 
+def _policy_sort(demand: dict, policy: str):
+    if policy == "internal":
+        return (0 if demand["demand_type"] == "Internal" else 1, -demand["unit_expected_rm"], demand["required_date"], demand["id"])
+    if policy == "external":
+        return (0 if demand["demand_type"] == "External" else 1, -demand["unit_expected_rm"], demand["required_date"], demand["id"])
+    if policy == "practice":
+        # Illustrative informal rule. Firm orders first, then the due date, then commercial
+        # margin and penalty. Programme delay is intentionally left out of this sort.
+        certainty = {"Confirmed": 0, "Probable": 1, "Forecast": 2}.get(demand["confidence_level"], 1)
+        commercial = float(demand["margin_per_m3"]) + float(demand["penalty_per_m3"])
+        return (certainty, demand["required_date"], -commercial, demand["id"])
+    return (demand["required_date"], -demand["unit_expected_rm"], demand["id"])
+
+
 def _greedy(demands: list[dict], days: list[str], cap: dict[str, float], usable: float, policy: str) -> dict[int, dict]:
     remaining_cap = dict(cap)
     remaining_inv = usable
 
-    def sort_key(demand: dict):
-        if policy == "internal":
-            return (0 if demand["demand_type"] == "Internal" else 1, -demand["unit_expected_rm"], demand["required_date"], demand["id"])
-        if policy == "external":
-            return (0 if demand["demand_type"] == "External" else 1, -demand["unit_expected_rm"], demand["required_date"], demand["id"])
-        if policy == "practice":
-            # Illustrative informal rule. Firm orders first, then the due date, then commercial
-            # margin and penalty. Programme delay is intentionally left out of this sort.
-            certainty = {"Confirmed": 0, "Probable": 1, "Forecast": 2}.get(demand["confidence_level"], 1)
-            commercial = float(demand["margin_per_m3"]) + float(demand["penalty_per_m3"])
-            return (certainty, demand["required_date"], -commercial, demand["id"])
-        return (demand["required_date"], -demand["unit_expected_rm"], demand["id"])
-
     plan: dict[int, dict] = {}
-    for demand in sorted(demands, key=sort_key):
+    for demand in sorted(demands, key=lambda row: _policy_sort(row, policy)):
         need = float(demand["quantity"])
         from_inv = min(need, remaining_inv)
         remaining_inv -= from_inv
@@ -304,7 +427,7 @@ def _greedy(demands: list[dict], days: list[str], cap: dict[str, float], usable:
 
 
 def _line_view(demand: dict, slot: dict, rank: int, emergency: float, emergency_is_assumption: bool) -> dict:
-    impact = consequence_for_unserved(demand, slot["unserved"])
+    impact = slot.get("impact_override") or consequence_for_unserved(demand, slot["unserved"])
     avoided_days = 0.0
     if demand["demand_type"] == "Internal" and demand["quantity"] > 0:
         avoided_days = float(demand["delay_days_if_unserved"]) * (slot["allocated"] / demand["quantity"])
@@ -316,8 +439,10 @@ def _line_view(demand: dict, slot: dict, rank: int, emergency: float, emergency_
         "customer_type": demand["customer_type"],
         "required_date": demand["required_date"],
         "requested_quantity": round_m3(demand["quantity"]),
-        "allocated_quantity": impact["allocated_quantity"],
-        "unserved_quantity": impact["unserved_quantity"],
+        "confirmed_quantity": round_m3(float(demand.get("confirmed_quantity") or 0)),
+        "allocated_quantity": round_m3(slot["allocated"]) if slot.get("impact_override") else impact["allocated_quantity"],
+        "unserved_quantity": round_m3(slot["unserved"]) if slot.get("impact_override") else impact["unserved_quantity"],
+        "tranche_note": slot.get("tranche_note") or "",
         "confidence_level": demand["confidence_level"],
         "confidence_factor": demand["confidence_factor"],
         "project_criticality": demand["project_criticality"],
@@ -615,7 +740,7 @@ def _windows(demands: list[dict], days: list[str], cap: dict[str, float], usable
     return windows
 
 
-def solve_bucket(world: dict, plant_id: int, product_id: int) -> dict:
+def solve_bucket(world: dict, plant_id: int, product_id: int, plans: dict | None = None) -> dict:
     plant = _plant(world, plant_id)
     product = _product(world, product_id)
     days = sorted(
@@ -635,23 +760,24 @@ def solve_bucket(world: dict, plant_id: int, product_id: int) -> dict:
     ]
     inventory = next(row for row in world["inventory"] if row["plant_id"] == plant_id and row["product_id"] == product_id)
     usable = float(inventory["usable"])
-    demands = _prepare_demands(
-        [row for row in world["demands"] if row["plant_id"] == plant_id and row["product_id"] == product_id]
-    )
+    raw_demands = [row for row in world["demands"] if row["plant_id"] == plant_id and row["product_id"] == product_id]
+    demands = _prepare_demands(raw_demands)
     emergency = float(product["emergency_cost_per_m3"])
     assumption = bool(product["emergency_cost_is_assumption"])
-    optimised_plan = _solve_lp(demands, days, cap, usable)
+    if plans is None:
+        plans = _plans_for(raw_demands, days, cap, usable)
+    optimised_plan = plans["optimised"]
     policies = [
-        _policy_block("optimised", "Minimise business consequence", "Linear programme (CBC)", demands, optimised_plan, emergency, assumption),
-        _policy_block("internal", "Internal projects first", "Priority rule on the same capacity", demands, _greedy(demands, days, cap, usable, "internal"), emergency, assumption),
-        _policy_block("external", "External customers first", "Priority rule on the same capacity", demands, _greedy(demands, days, cap, usable, "external"), emergency, assumption),
-        _policy_block("earliest", "Earliest required date", "Priority rule on the same capacity", demands, _greedy(demands, days, cap, usable, "earliest"), emergency, assumption),
+        _policy_block("optimised", "Minimise business consequence", "Linear programme (CBC)", demands, plans["optimised"], emergency, assumption),
+        _policy_block("internal", "Internal projects first", "Priority rule on the same capacity", demands, plans["internal"], emergency, assumption),
+        _policy_block("external", "External customers first", "Priority rule on the same capacity", demands, plans["external"], emergency, assumption),
+        _policy_block("earliest", "Earliest required date", "Priority rule on the same capacity", demands, plans["earliest"], emergency, assumption),
         _policy_block(
             "practice",
             "Current practice proxy",
             "Illustrative rule on the same capacity. Not observed history. Firm orders, then due date, then margin and penalty. Programme delay is ignored.",
             demands,
-            _greedy(demands, days, cap, usable, "practice"),
+            plans["practice"],
             emergency,
             assumption,
         ),
@@ -718,6 +844,7 @@ def solve_bucket(world: dict, plant_id: int, product_id: int) -> dict:
         "product_id": product_id,
         "product_name": product["name"],
         "product_code": product["code"],
+        "stockable": product_is_stockable(product),
         "unit": product["unit"],
         "constrained": totals["unserved_m3"] > TOL,
         "inventory_value_per_m3": product["inventory_value_per_m3"],
@@ -750,16 +877,180 @@ def solve_bucket(world: dict, plant_id: int, product_id: int) -> dict:
             "produced_for_allocation_m3": round_m3(sum(slot["from_production"] for slot in optimised_plan.values())),
             "projected_closing_on_hand_m3": round_m3(max(0.0, float(inventory["on_hand"]) - inventory_used)),
             "basis": (
-                "Projected, not observed. This model makes product only for the allocation, so production does not "
-                "increase stock. Closing on-hand is opening on-hand minus inventory drawn. There is no delivery ledger."
+                "Ready-mix cannot be stocked. On-hand, safety stock, and usable inventory are zero."
+                if not product_is_stockable(product)
+                else (
+                    "Projected, not observed. This model makes product only for the allocation, so production does not "
+                    "increase stock. Closing on-hand is opening on-hand minus inventory drawn. There is no delivery ledger."
+                )
             ),
         },
     }
 
 
+def _bundle(world: dict, plant_id: int, product_id: int) -> dict:
+    raw = [row for row in world["demands"] if row["plant_id"] == plant_id and row["product_id"] == product_id]
+    days = sorted(
+        row["prod_date"] for row in world["calendar"] if row["plant_id"] == plant_id and row["product_id"] == product_id
+    )
+    cap = {
+        row["prod_date"]: float(row["available_capacity"])
+        for row in world["calendar"]
+        if row["plant_id"] == plant_id and row["product_id"] == product_id
+    }
+    inventory = next(row for row in world["inventory"] if row["plant_id"] == plant_id and row["product_id"] == product_id)
+    return {
+        "product_id": product_id,
+        "parents": _prepare_demands(raw),
+        "tranches": _prepare_demands([piece for demand in raw for piece in expand_tranches(demand)]),
+        "days": days,
+        "cap": cap,
+        "usable": float(inventory["usable"]),
+    }
+
+
+def _solve_bundles(bundles: list[dict], shared: bool) -> dict[int, dict]:
+    """One linear programme. When shared is true, ready-mix grades share a plant-day cap."""
+    demands = [demand for bundle in bundles for demand in bundle["tranches"]]
+    if not demands:
+        return {}
+    problem = pulp.LpProblem("capacity_allocation_shared", pulp.LpMinimize)
+    production: dict[tuple[int, str], pulp.LpVariable] = {}
+    inventory_use: dict[int, pulp.LpVariable] = {}
+    unserved: dict[int, pulp.LpVariable] = {}
+    for bundle in bundles:
+        for demand in bundle["tranches"]:
+            demand_id = int(demand["id"])
+            inventory_use[demand_id] = pulp.LpVariable(f"sinv_{demand_id}", lowBound=0)
+            unserved[demand_id] = pulp.LpVariable(f"suns_{demand_id}", lowBound=0, upBound=demand["quantity"])
+            for day in bundle["days"]:
+                if day <= demand["required_date"]:
+                    production[demand_id, day] = pulp.LpVariable(f"sp_{demand_id}_{day.replace('-', '')}", lowBound=0)
+    problem += pulp.lpSum(demand["unit_expected_rm"] * unserved[int(demand["id"])] for demand in demands) + (
+        1e-4 * pulp.lpSum(production.values())
+    )
+    for demand in demands:
+        demand_id = int(demand["id"])
+        made = pulp.lpSum(var for (owner, _day), var in production.items() if owner == demand_id)
+        problem += made + inventory_use[demand_id] + unserved[demand_id] == demand["quantity"], f"sbalance_{demand_id}"
+    for bundle in bundles:
+        owners = {int(demand["id"]) for demand in bundle["tranches"]}
+        for day, limit in bundle["cap"].items():
+            users = [production[owner, day] for owner in owners if (owner, day) in production]
+            if users:
+                problem += pulp.lpSum(users) <= limit, f"cap_{bundle['product_id']}_{day.replace('-', '')}"
+        if owners:
+            problem += pulp.lpSum(inventory_use[owner] for owner in owners) <= bundle["usable"], f"inventory_{bundle['product_id']}"
+    if shared:
+        days = sorted({day for bundle in bundles for day in bundle["days"]})
+        for day in days:
+            users = []
+            limits = []
+            for bundle in bundles:
+                if day in bundle["cap"]:
+                    limits.append(bundle["cap"][day])
+                owners = {int(demand["id"]) for demand in bundle["tranches"]}
+                users.extend(production[owner, day] for owner in owners if (owner, day) in production)
+            if users and limits:
+                problem += pulp.lpSum(users) <= max(limits), f"shared_{day.replace('-', '')}"
+    status = problem.solve(pulp.PULP_CBC_CMD(msg=False))
+    if pulp.LpStatus[status] != "Optimal":
+        raise RuntimeError(f"Allocation solver returned {pulp.LpStatus[status]}.")
+    plan: dict[int, dict] = {}
+    for demand in demands:
+        demand_id = int(demand["id"])
+        qty = float(demand["quantity"])
+        inv = float(pulp.value(inventory_use[demand_id]) or 0.0)
+        made = sum(float(pulp.value(var) or 0.0) for (owner, _day), var in production.items() if owner == demand_id)
+        allocated = _snap(inv + made, qty)
+        inv = min(inv, allocated)
+        made = max(0.0, allocated - inv)
+        by_day = []
+        for (owner, day), var in production.items():
+            if owner != demand_id:
+                continue
+            amount = float(pulp.value(var) or 0.0)
+            if amount > TOL:
+                by_day.append({"date": day, "quantity": round_m3(amount)})
+        plan[demand_id] = {
+            "allocated": allocated,
+            "unserved": round_m3(qty - allocated),
+            "from_inventory": round_m3(inv),
+            "from_production": round_m3(made),
+            "by_day": by_day,
+        }
+    return plan
+
+
+def _greedy_bundles(bundles: list[dict], policy: str, shared: bool) -> dict[int, dict]:
+    remaining_cap = {(bundle["product_id"], day): qty for bundle in bundles for day, qty in bundle["cap"].items()}
+    remaining_inv = {bundle["product_id"]: bundle["usable"] for bundle in bundles}
+    days = sorted({day for bundle in bundles for day in bundle["days"]})
+    remaining_shared = {day: max(bundle["cap"].get(day, 0.0) for bundle in bundles) for day in days}
+    owner = {int(demand["id"]): bundle["product_id"] for bundle in bundles for demand in bundle["tranches"]}
+    demands = [demand for bundle in bundles for demand in bundle["tranches"]]
+    plan: dict[int, dict] = {}
+    for demand in sorted(demands, key=lambda row: _policy_sort(row, policy)):
+        product_id = owner[int(demand["id"])]
+        need = float(demand["quantity"])
+        from_inv = min(need, remaining_inv[product_id])
+        remaining_inv[product_id] -= from_inv
+        need -= from_inv
+        from_prod = 0.0
+        for day in days:
+            if day > demand["required_date"] or need <= TOL:
+                continue
+            product_left = remaining_cap.get((product_id, day), 0.0)
+            shared_left = remaining_shared[day] if shared else product_left
+            take = min(need, product_left, shared_left)
+            if take <= 0:
+                continue
+            remaining_cap[product_id, day] = product_left - take
+            if shared:
+                remaining_shared[day] -= take
+            need -= take
+            from_prod += take
+        qty = float(demand["quantity"])
+        allocated = _snap(qty - max(need, 0.0), qty)
+        plan[int(demand["id"])] = {
+            "allocated": allocated,
+            "unserved": round_m3(qty - allocated),
+            "from_inventory": round_m3(from_inv),
+            "from_production": round_m3(from_prod),
+            "by_day": [],
+        }
+    return plan
+
+
+def _shared_plans(world: dict, plant_id: int, product_ids: list[int]) -> dict[int, dict]:
+    bundles = [_bundle(world, plant_id, product_id) for product_id in product_ids]
+    plans = {product_id: {} for product_id in product_ids}
+    optimised = _solve_bundles(bundles, shared=True)
+    for bundle in bundles:
+        plans[bundle["product_id"]]["optimised"] = _collapse_plan(bundle["parents"], bundle["tranches"], optimised)
+    for policy in ("internal", "external", "earliest", "practice"):
+        filled = _greedy_bundles(bundles, policy, shared=True)
+        for bundle in bundles:
+            plans[bundle["product_id"]][policy] = _collapse_plan(bundle["parents"], bundle["tranches"], filled)
+    return plans
+
+
 def allocate(scenario: dict | None = None) -> dict:
     world = apply_scenario(load_world(), scenario)
-    buckets = [solve_bucket(world, plant["id"], product["id"]) for plant in world["plants"] for product in world["products"]]
+    world["shared_ready_mix_batching"] = bool(world.get("shared_ready_mix_batching", SHARED_READY_MIX_BATCHING))
+    buckets = []
+    for plant in world["plants"]:
+        ready = [product for product in world["products"] if product["code"] in READY_MIX_CODES]
+        others = [product for product in world["products"] if product["code"] not in READY_MIX_CODES]
+        if world["shared_ready_mix_batching"] and len(ready) > 1:
+            shared = _shared_plans(world, plant["id"], [product["id"] for product in ready])
+            for product in ready:
+                buckets.append(solve_bucket(world, plant["id"], product["id"], shared[product["id"]]))
+        else:
+            for product in ready:
+                buckets.append(solve_bucket(world, plant["id"], product["id"]))
+        for product in others:
+            buckets.append(solve_bucket(world, plant["id"], product["id"]))
     buckets.sort(key=lambda row: (-row["shortfall_m3"], row["plant_name"], row["product_name"]))
 
     def add(key: str) -> float:
@@ -919,6 +1210,7 @@ def capacity_view(plant_id: int, product_id: int) -> dict:
         "plant": plant,
         "product": product,
         "inventory": {
+            "stockable": product_is_stockable(product),
             "as_of_date": inventory["as_of_date"],
             "on_hand_m3": inventory["on_hand"],
             "safety_stock_m3": inventory["safety_stock"],
@@ -929,8 +1221,12 @@ def capacity_view(plant_id: int, product_id: int) -> dict:
         },
         "formulas": {
             "available_capacity": "Plant capacity − already planned production",
-            "usable_inventory": "max(0, on-hand − safety stock)",
-            "available_supply": "Available capacity + usable inventory",
+            **(
+                {}
+                if not product_is_stockable(product)
+                else {"usable_inventory": "max(0, on-hand − safety stock)"}
+            ),
+            "available_supply": "Dated capacity only. Ready-mix cannot be stocked." if not product_is_stockable(product) else "Available capacity + usable inventory",
             "dated_gap": "Demand due by a date − supply available on or before that date",
         },
         "series": series,

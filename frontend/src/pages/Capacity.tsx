@@ -22,7 +22,7 @@ type Series = {
 type View = {
   plant: { name: string };
   product: { name: string };
-  inventory: { on_hand_m3: number; safety_stock_m3: number; usable_m3: number; inventory_value_rm: number; value_is_assumption: boolean };
+  inventory: { stockable: boolean; on_hand_m3: number; safety_stock_m3: number; usable_m3: number; inventory_value_rm: number; value_is_assumption: boolean };
   formulas: Record<string, string>;
   series: Series[];
   constrained_dates: string[];
@@ -55,7 +55,7 @@ export function CapacityPage() {
       <PageHeader
         kicker="Supply by date"
         title="Capacity Planner"
-        lede="Available capacity is what remains after production already committed outside this demand book. Usable inventory is on-hand stock above safety stock."
+        lede="Available capacity is what remains after production already committed outside this demand book. Ready-mix cannot be stocked. Precast usable inventory is on-hand stock above safety stock."
       />
       {error ? <ErrorNote message={error} /> : null}
       <div className="filters">
@@ -74,11 +74,15 @@ export function CapacityPage() {
       </div>
       {view ? (
         <>
-          <div className="kpi-grid">
-            <article className="kpi"><p>On hand</p><strong>{m3(view.inventory.on_hand_m3)}</strong><span>Assumption value {rm(view.inventory.inventory_value_rm)}</span></article>
-            <article className="kpi"><p>Safety stock</p><strong>{m3(view.inventory.safety_stock_m3)}</strong><span>Reserved. Not allocated.</span></article>
-            <article className="kpi"><p>Usable inventory</p><strong>{m3(view.inventory.usable_m3)}</strong><span>Added to available capacity.</span></article>
-          </div>
+          {view.inventory.stockable ? (
+            <div className="kpi-grid">
+              <article className="kpi"><p>On hand</p><strong>{m3(view.inventory.on_hand_m3)}</strong><span>Assumption value {rm(view.inventory.inventory_value_rm)}</span></article>
+              <article className="kpi"><p>Safety stock</p><strong>{m3(view.inventory.safety_stock_m3)}</strong><span>Reserved. Not allocated.</span></article>
+              <article className="kpi"><p>Usable inventory</p><strong>{m3(view.inventory.usable_m3)}</strong><span>Added to available capacity.</span></article>
+            </div>
+          ) : (
+            <p className="note">Ready-mix cannot be stocked. On-hand, safety stock, and usable inventory are not used for this product.</p>
+          )}
           <Panel title="Formulas">
             <div className="detail">
               {Object.entries(view.formulas).map(([key, formula]) => <p key={key}><strong>{key.replaceAll("_", " ")}:</strong> {formula}</p>)}

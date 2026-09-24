@@ -53,7 +53,7 @@ def test_hero_book_serves_higher_consequence_not_internal_label() -> None:
     result = allocate(None)
     hero = _bucket(result, "Shah Alam Works", "G40")
     assert _line(hero, "INT-MERDEKA")["allocated_quantity"] == 400
-    assert _line(hero, "EXT-GAMUDA")["allocated_quantity"] == 300
+    assert _line(hero, "EXT-GAMUDA")["allocated_quantity"] == 235
     assert _line(hero, "EXT-JKR")["unserved_quantity"] > 179
     policies = {row["policy_code"]: row["expected_consequence_rm"] for row in hero["policies"]}
     assert policies["optimised"] < policies["internal"]
@@ -96,11 +96,60 @@ def test_override_cannot_invent_dated_supply() -> None:
     assert fit["feasible"] is False
 
 
-def test_zero_demand_is_ignored_and_safety_stock_is_not_usable() -> None:
+def test_ready_mix_is_not_stocked_and_precast_safety_stock_is_reserved() -> None:
     world = load_world()
-    stock = next(row for row in world["inventory"] if row["plant_id"] == 1 and row["product_id"] == 1)
-    assert stock["usable"] == stock["on_hand"] - stock["safety_stock"]
-    assert stock["usable"] < stock["on_hand"]
+    ready = next(row for row in world["inventory"] if row["plant_id"] == 1 and row["product_id"] == 1)
+    assert ready["on_hand"] == 0
+    assert ready["safety_stock"] == 0
+    assert ready["usable"] == 0
+    precast = next(row for row in world["inventory"] if row["plant_id"] == 1 and row["product_id"] == 3)
+    assert precast["usable"] == precast["on_hand"] - precast["safety_stock"]
+    assert precast["usable"] < precast["on_hand"]
+
+
+def test_unconfirmed_remainder_is_a_lower_weighted_tranche() -> None:
+    hero = _bucket(allocate(None), "Shah Alam Works", "G40")
+    sunway = _line(hero, "EXT-SUNWAY")
+    assert sunway["confirmed_quantity"] == 180
+    assert sunway["requested_quantity"] == 220
+    assert "180" in sunway["tranche_note"]
+    assert "75%" in sunway["tranche_note"]
+    assert "40" in sunway["tranche_note"]
+
+
+def test_excess_window_follows_the_as_of_date() -> None:
+    from app.impact import build_impact
+
+    impact = build_impact()
+    assert impact["inventory"]["excess_cover_days"] == 14
+    assert impact["inventory"]["excess_window_end"] == "2026-10-14"
+    assert all("Ready-Mix" not in line["product_name"] for line in impact["inventory"]["lines"])
+
+
+def test_shared_batching_flag_caps_both_grades_on_a_day() -> None:
+    from app.economics import SHARED_READY_MIX_BATCHING
+
+    assert SHARED_READY_MIX_BATCHING is False
+    shared = allocate({"name": "Shared batching", "shared_ready_mix_batching": True, "capacity_factor": 1})
+    world_caps: dict[tuple[int, str], float] = {}
+    from app.engine import load_world
+
+    world = load_world()
+    for row in world["calendar"]:
+        if row["product_id"] in (1, 2):
+            key = (row["plant_id"], row["prod_date"])
+            world_caps[key] = max(world_caps.get(key, 0.0), float(row["available_capacity"]))
+    used: dict[tuple[int, str], float] = {}
+    for bucket in shared["buckets"]:
+        if bucket["product_code"] not in ("G40", "G50"):
+            continue
+        for line in bucket["allocations"]:
+            for slot in line["production_by_day"]:
+                key = (bucket["plant_id"], slot["date"])
+                used[key] = used.get(key, 0.0) + float(slot["quantity"])
+    assert used
+    for key, quantity in used.items():
+        assert quantity <= world_caps[key] + 0.2
 
 
 def test_quality_score_is_the_share_of_checks_that_passed() -> None:

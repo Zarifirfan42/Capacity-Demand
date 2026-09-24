@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS products (
     unit TEXT NOT NULL,
     inventory_value_per_m3 REAL NOT NULL,
     emergency_cost_per_m3 REAL NOT NULL,
-    emergency_cost_is_assumption INTEGER NOT NULL DEFAULT 1
+    emergency_cost_is_assumption INTEGER NOT NULL DEFAULT 1,
+    stockable INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS capacity_calendar (
@@ -138,6 +139,7 @@ def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
         _ensure_decision_columns(conn)
+        _ensure_product_columns(conn)
 
 
 def _ensure_decision_columns(conn: sqlite3.Connection) -> None:
@@ -153,6 +155,12 @@ def _ensure_decision_columns(conn: sqlite3.Connection) -> None:
     for name, declaration in additions.items():
         if name not in present:
             conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {declaration}")
+
+
+def _ensure_product_columns(conn: sqlite3.Connection) -> None:
+    present = {row[1] for row in conn.execute("PRAGMA table_info(products)").fetchall()}
+    if "stockable" not in present:
+        conn.execute("ALTER TABLE products ADD COLUMN stockable INTEGER NOT NULL DEFAULT 1")
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:

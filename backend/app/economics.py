@@ -24,6 +24,12 @@ REVIEW_PROGRAMME_DAYS = 2.0
 REVIEW_EXPECTED_CONSEQUENCE_RM = 25000.0
 REVIEW_PENALTY_RM = 20000.0
 CARRYING_RATE_ANNUAL = 0.08
+# Inclusive days of forward demand used to judge excess stock. Counted from each stock row's as-of date.
+EXCESS_COVER_DAYS = 14
+# This book gives Grade 40 and Grade 50 separate dated capacities. The flag is off.
+# Turn it on only when one batching plant must serve both grades.
+SHARED_READY_MIX_BATCHING = False
+READY_MIX_CODES = ("G40", "G50")
 
 CRITICALITY_MULT = {
     "Critical": 1.5,
@@ -36,7 +42,10 @@ CRITICALITY_MULT = {
 ASSUMPTIONS = [
     "Figures are synthetic. Inventory unit values, emergency production costs, and several programme delay rates are marked assumptions because a live ERP extract is not connected.",
     "Available capacity = daily plant capacity − production already committed outside this demand book.",
-    "Usable inventory = max(0, on-hand − safety stock). Safety stock is reserved and is not allocated.",
+    "Usable inventory = max(0, on-hand − safety stock). Safety stock is reserved and is not allocated. Ready-mix Grade 40 and Grade 50 cannot be stocked, so those quantities are zero. Inventory value and carrying cost are precast only.",
+    "Confirmed cubic metres are weighted at 100%. Requested minus confirmed is a separate tranche, weighted at 75%, or at 45% when the line is Forecast.",
+    "Excess stock is on-hand minus safety stock minus demand due inside a 14-day window starting on the stock as-of date. The 14 days are a parameter, not a fixed calendar date.",
+    "Grade 40 and Grade 50 do not share a batching plant in this book. Each grade has its own dated capacity. The shared-batching flag is off. When it is on, their combined production on a day cannot exceed the larger grade's available capacity that day.",
     "Available supply = available capacity + usable inventory.",
     "An order can only use its own plant and its own product, on or before its required date. Products are not substitutes, and plants are not balanced automatically.",
     "Partial supply is allowed. Margin, contractual penalty, and programme delay cost scale with the unserved fraction of the order.",

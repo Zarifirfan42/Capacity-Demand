@@ -41,6 +41,7 @@ type Impact = {
     excess_inventory_value_rm: number;
     working_capital_rm: number;
     carrying_cost_rm: number;
+    excess_cover_days: number;
     working_capital_note: string;
     inventory_consumed_value_rm: number;
     inventory_at_risk_rm: number;
@@ -112,7 +113,7 @@ export function ImpactPage() {
       </Panel>
       <div className="kpi-grid">
         <Kpi label="Inventory value" value={rm(data.inventory.inventory_value_rm)} hint="On-hand × assumed unit cost. This balance is not the carrying cost." />
-        <Kpi label="Excess inventory" value={rm(data.inventory.excess_inventory_value_rm)} hint={`${m3(data.inventory.excess_inventory_m3)} above safety stock and 14-day demand.`} />
+        <Kpi label="Excess inventory" value={rm(data.inventory.excess_inventory_value_rm)} hint={`${m3(data.inventory.excess_inventory_m3)} of precast above safety stock and ${data.inventory.excess_cover_days}-day demand.`} />
         <Kpi label="Carrying cost this horizon" value={rm(data.inventory.carrying_cost_rm)} hint={data.inventory.working_capital_note} />
         <Kpi label="Margin deferred in the pilot" value={rm(pilot?.margin_at_risk_rm)} tone="risk" />
         <Kpi label="Programme days in the pilot" value={num(pilot?.programme_days, 1)} tone="risk" hint={`Delay cost ${rm(pilot?.delay_cost_rm)}`} />

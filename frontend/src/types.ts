@@ -68,6 +68,8 @@ export type AllocationLine = {
   customer_type: string;
   required_date: string;
   requested_quantity: number;
+  confirmed_quantity?: number;
+  tranche_note?: string;
   allocated_quantity: number;
   unserved_quantity: number;
   confidence_level: string;
@@ -112,6 +114,7 @@ export type Bucket = {
   plant_name: string;
   product_name: string;
   product_code: string;
+  stockable?: boolean;
   constrained: boolean;
   available_capacity_m3: number;
   usable_inventory_m3: number;

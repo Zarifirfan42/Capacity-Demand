@@ -140,7 +140,7 @@ export function AllocationPage() {
       {saved ? <div className="banner good">{saved}</div> : null}
 
       <div className="kpi-grid">
-        <Kpi label="Available supply" value={m3(bucket.available_supply_m3)} hint={`${m3(bucket.available_capacity_m3)} capacity + ${m3(bucket.usable_inventory_m3)} usable inventory`} />
+        <Kpi label="Available supply" value={m3(bucket.available_supply_m3)} hint={bucket.stockable === false ? "Ready-mix cannot be stocked. Supply is dated capacity only." : `${m3(bucket.available_capacity_m3)} capacity + ${m3(bucket.usable_inventory_m3)} usable inventory`} />
         <Kpi label="Total demand" value={m3(bucket.total_demand_m3)} hint={`${m3(bucket.internal_demand_m3)} internal · ${m3(bucket.external_demand_m3)} external`} />
         <Kpi label="Shortfall" value={m3(bucket.shortfall_m3)} tone={bucket.shortfall_m3 > 0 ? "risk" : "good"} hint="Unserved after required dates are respected" />
         <Kpi label="Expected consequence" value={rm(bucket.expected_consequence_rm)} tone="risk" hint={`Gross if every open order firms: ${rm(bucket.gross_consequence_rm)}`} />
@@ -157,7 +157,7 @@ export function AllocationPage() {
         </Panel>
       ) : null}
 
-      <Panel title="Why this allocation" sub="The ranking is expected ringgit consequence per cubic metre, scaled by a planning-certainty weight. It is not an internal or external rule.">
+      <Panel title="Why this allocation" sub="Confirmed cubic metres use a 100% weight. The unconfirmed remainder is a separate tranche at 75%, or 45% when the line is a forecast. The ranking is expected ringgit per cubic metre. It is not an internal or external rule.">
         <div className="explain">
           {bucket.explanation.paragraphs.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
           <ol className="ranking">
@@ -236,7 +236,7 @@ export function AllocationPage() {
                       onChange={(event) => setEdits({ ...edits, [line.demand_id]: Number(event.target.value) })}
                     />
                   </td>
-                  <td className="reason">{line.why_not || line.reason}</td>
+                  <td className="reason">{line.why_not || line.reason}{line.tranche_note ? <div className="note">{line.tranche_note}</div> : null}</td>
                 </tr>
               ))}
             </tbody>
@@ -255,7 +255,7 @@ export function AllocationPage() {
             ) : null}
           </div>
         ) : null}
-        {bucket.inventory_projection ? (
+        {bucket.stockable !== false && bucket.inventory_projection ? (
           <p className="note">
             Projected stock: opening {m3(bucket.inventory_projection.opening_on_hand_m3)}, drawn {m3(bucket.inventory_projection.drawn_from_inventory_m3)}, produced for this allocation {m3(bucket.inventory_projection.produced_for_allocation_m3)}, closing on-hand {m3(bucket.inventory_projection.projected_closing_on_hand_m3)}. {bucket.inventory_projection.basis}
           </p>

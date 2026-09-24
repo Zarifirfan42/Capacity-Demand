@@ -29,10 +29,12 @@ def main() -> None:
     assert abs(hero["windows"][-1]["supply_to_date_m3"] - 0) >= 0
     crunch = max(hero["windows"], key=lambda row: row["gap_m3"])
     assert crunch["date"] == "2026-10-09", crunch
-    assert abs(crunch["supply_to_date_m3"] - 700) < 1, crunch
-    assert abs(crunch["gap_m3"] - 710) < 1, crunch
+    assert abs(crunch["supply_to_date_m3"] - 635) < 1, crunch
+    assert abs(crunch["gap_m3"] - 775) < 1, crunch
+    assert abs(crunch["usable_inventory_m3"]) < 0.2, crunch
     assert abs(merdeka["allocated_quantity"] - 400) < 0.2, merdeka
-    assert abs(gamuda["allocated_quantity"] - 300) < 0.2, gamuda
+    assert abs(gamuda["allocated_quantity"] - 235) < 0.2, gamuda
+    assert gamuda["unserved_quantity"] > 64
     assert jkr["unserved_quantity"] > 179, jkr
     assert sunway["unserved_quantity"] > 219, sunway
     assert elmina["unserved_quantity"] > 149, elmina
@@ -49,7 +51,8 @@ def main() -> None:
     assert "RM8" in hero["explanation"]["tradeoff"] or "RM8/" in hero["explanation"]["tradeoff"]
 
     g50 = _bucket(result, "Shah Alam Works", "G50")
-    assert _line(g50, "INT-PENANG")["unserved_quantity"] < 0.2
+    assert abs(_line(g50, "INT-PENANG")["allocated_quantity"] - 190) < 0.2
+    assert abs(_line(g50, "INT-PENANG")["unserved_quantity"] - 20) < 0.2
     assert _line(g50, "EXT-IJM")["unserved_quantity"] > 149
 
     pcs = _bucket(result, "Pasir Gudang Works", "PCS")

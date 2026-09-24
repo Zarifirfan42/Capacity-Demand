@@ -10,10 +10,11 @@ person records a decision. None of these figures are observed savings.
 from __future__ import annotations
 
 import json
+from datetime import date, timedelta
 
 from app.db import connect, fetch_all
-from app.economics import ASSUMPTIONS, carrying_cost, round_m3, round_rm
-from app.engine import allocate, load_world, value_protected_band
+from app.economics import ASSUMPTIONS, EXCESS_COVER_DAYS, carrying_cost, round_m3, round_rm
+from app.engine import allocate, load_world, product_is_stockable, value_protected_band
 
 
 def _blank() -> dict:
@@ -49,18 +50,23 @@ def _inventory(world: dict, result: dict) -> dict:
     excess_value = 0.0
     excess_m3 = 0.0
     lines = []
+    window_end = ""
     for stock in world["inventory"]:
         product = next(row for row in world["products"] if row["id"] == stock["product_id"])
+        if not product_is_stockable(product):
+            continue
         plant = next(row for row in world["plants"] if row["id"] == stock["plant_id"])
         unit = float(product["inventory_value_per_m3"])
         on_hand = float(stock["on_hand"])
         safety = float(stock["safety_stock"])
+        as_of = date.fromisoformat(str(stock["as_of_date"]))
+        window_end = (as_of + timedelta(days=EXCESS_COVER_DAYS - 1)).isoformat()
         forward = sum(
             float(demand["requested_quantity"])
             for demand in world["demands"]
             if demand["plant_id"] == stock["plant_id"]
             and demand["product_id"] == stock["product_id"]
-            and demand["required_date"] <= "2026-10-14"
+            and demand["required_date"] <= window_end
         )
         excess = max(0.0, on_hand - safety - forward)
         line_value = on_hand * unit
@@ -76,7 +82,8 @@ def _inventory(world: dict, result: dict) -> dict:
                 "on_hand_m3": on_hand,
                 "safety_stock_m3": safety,
                 "usable_m3": stock["usable"],
-                "forward_14_day_demand_m3": round_m3(forward),
+                "forward_cover_demand_m3": round_m3(forward),
+                "stockable": True,
                 "excess_m3": round_m3(excess),
                 "inventory_value_rm": round_rm(line_value),
                 "excess_value_rm": round_rm(excess * unit),
@@ -100,9 +107,14 @@ def _inventory(world: dict, result: dict) -> dict:
         "working_capital_rm": round_rm(value),
         "carrying_cost_rm": carrying_cost(value),
         "carrying_rate_annual": 0.08,
+        "excess_cover_days": EXCESS_COVER_DAYS,
+        "excess_window_end": window_end,
         "working_capital_note": (
-            "Inventory value is on-hand × the assumed unit cost. That balance is not the carrying cost. "
-            "Carrying cost for this 30-day horizon = inventory value × 8% a year × 30/365. The 8% rate is an assumption."
+            "Precast only. Ready-mix cannot be stocked. Inventory value is on-hand × the assumed unit cost. "
+            "That balance is not the carrying cost. "
+            f"Carrying cost for this 30-day horizon = inventory value × 8% a year × 30/365. "
+            f"Excess is on-hand above safety stock and demand due by {window_end}, "
+            f"which is {EXCESS_COVER_DAYS} days from the stock as-of date. The 8% rate and the {EXCESS_COVER_DAYS}-day window are assumptions."
         ),
         "inventory_consumed_value_rm": round_rm(consumed_value),
         "inventory_at_risk_rm": round_rm(constrained_on_hand_value),

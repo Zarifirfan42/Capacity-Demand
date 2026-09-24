@@ -1,8 +1,9 @@
 """Synthetic book of business for October 2026.
 
 The Shah Alam Grade 40 book is constructed so that orders due by 9 Oct compete
-for exactly 700 m³. Month-total capacity still covers month-total volume. The
-problem is the date, which is the point of the prototype.
+for dated capacity. Ready-mix cannot be stocked, so that supply is capacity
+only. Month-total capacity can still cover month-total volume. The problem is
+the date.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from app.db import connect, get_meta, init_db, reset_data, set_meta
 from app.forecast import history_rows
 from app.economics import HORIZON_DAYS, HORIZON_START
 
-SEED_VERSION = "2026-10-hero-2"
+SEED_VERSION = "2026-10-hero-3"
 START = date.fromisoformat(HORIZON_START)
 
 
@@ -86,19 +87,20 @@ PLANTS = [
 
 PRODUCTS = [
     # id, code, name, unit, inventory RM/m3 (assumption), emergency RM/m3 (assumption)
-    (1, "G40", "Ready-Mix Grade 40", "m³", 280.0, 95.0),
-    (2, "G50", "Ready-Mix Grade 50", "m³", 340.0, 110.0),
-    (3, "PCS", "Precast Wall Panel", "m³", 1200.0, 180.0),
+    # id, code, name, unit, inventory RM/m3 (assumption), emergency RM/m3 (assumption), stockable
+    # Ready-mix cannot be held. Precast can.
+    (1, "G40", "Ready-Mix Grade 40", "m³", 280.0, 95.0, 0),
+    (2, "G50", "Ready-Mix Grade 50", "m³", 340.0, 110.0, 0),
+    (3, "PCS", "Precast Wall Panel", "m³", 1200.0, 180.0, 1),
 ]
 
 INVENTORY = [
-    # plant, product, on_hand, safety. Usable = on_hand - safety.
-    # SA G40 usable 65 is part of the 700 m³ hero supply.
-    (1, 1, 145.0, 80.0),
-    (1, 2, 50.0, 30.0),
+    # plant, product, on_hand, safety. Ready-mix is zero because it cannot be stocked.
+    (1, 1, 0.0, 0.0),
+    (1, 2, 0.0, 0.0),
     (1, 3, 22.0, 16.0),
-    (2, 1, 90.0, 60.0),
-    (2, 2, 46.0, 30.0),
+    (2, 1, 0.0, 0.0),
+    (2, 2, 0.0, 0.0),
     (2, 3, 18.0, 12.0),
 ]
 
@@ -485,8 +487,8 @@ def seed(force: bool = False) -> None:
         conn.executemany("INSERT INTO plants(id, code, name, location) VALUES(?, ?, ?, ?)", PLANTS)
         conn.executemany(
             """
-            INSERT INTO products(id, code, name, unit, inventory_value_per_m3, emergency_cost_per_m3, emergency_cost_is_assumption)
-            VALUES(?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO products(id, code, name, unit, inventory_value_per_m3, emergency_cost_per_m3, emergency_cost_is_assumption, stockable)
+            VALUES(?, ?, ?, ?, ?, ?, 1, ?)
             """,
             PRODUCTS,
         )

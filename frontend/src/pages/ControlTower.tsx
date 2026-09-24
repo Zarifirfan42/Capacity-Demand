@@ -99,7 +99,7 @@ export function ControlTowerPage() {
       ) : null}
       <div className="kpi-grid">
         <Kpi label="Total demand" value={m3(k.total_demand_m3)} hint="Internal and external orders in one book" />
-        <Kpi label="Available capacity" value={m3(k.available_capacity_m3)} hint={`Plus ${m3(k.usable_inventory_m3)} usable inventory`} />
+        <Kpi label="Available capacity" value={m3(k.available_capacity_m3)} hint={`Plus ${m3(k.usable_inventory_m3)} usable precast inventory. Ready-mix is not stocked.`} />
         <Kpi label="Capacity gap" value={m3(k.capacity_gap_m3)} tone="risk" hint={`Dated shortfall. Month-total surplus is ${m3(k.horizon_surplus_m3)}.`} />
         <Kpi label="Internal demand" value={m3(k.internal_demand_m3)} hint="Group projects and plant work" />
         <Kpi label="External demand" value={m3(k.external_demand_m3)} hint="Customer orders" />

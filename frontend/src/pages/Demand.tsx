@@ -319,6 +319,7 @@ export function DemandPage() {
             <p>Customer consequence: {rm(selected.contractual_penalty)} contractual penalty.</p>
             <p>Project consequence: {selected.delay_days_if_unserved} days at {rm(selected.delay_cost_per_day)} per day.</p>
             <p>Operational constraint: {selected.product_name} at {selected.plant_name}, on or before {longDate(selected.required_date)}. It cannot use another product or plant.</p>
+            <p>The solver treats {m3(selected.confirmed_quantity)} as confirmed, at a 100% planning-certainty weight. The remaining {m3(Math.max(0, selected.requested_quantity - selected.confirmed_quantity))} is a separate tranche at 75%, or 45% if this line is a forecast.</p>
             {selected.demand_code.includes("-IN-") ? (
               <button className="btn" onClick={() => remove(selected)}>Remove this intake line</button>
             ) : null}
