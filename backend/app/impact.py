@@ -1,10 +1,9 @@
 """Business impact of the recommendation versus named allocation rules.
 
-The headline comparison is earliest-required-date on the same demand and
-supply. That rule is not a record of current practice. The practice proxy is
-an upper bound: it ignores programme delay when it ranks orders, then the
-score still charges the delay. The approved column appears only after a
-person records a decision. None of these figures are observed savings.
+The headline comparison is the best simple rule on the same demand and supply.
+Earliest-date is the second comparison. The practice proxy is a footnote.
+The approved column appears only after a person records a decision.
+None of these figures are observed savings.
 """
 
 from __future__ import annotations
@@ -14,7 +13,8 @@ from datetime import date, timedelta
 
 from app.db import connect, fetch_all
 from app.economics import ASSUMPTIONS, EXCESS_COVER_DAYS, carrying_cost, round_m3, round_rm
-from app.engine import allocate, load_world, product_is_stockable, value_protected_band
+from app.engine import allocate, load_world, product_is_stockable, value_of_information, value_protected_band
+from app.stress import load_stress_report
 
 
 def _blank() -> dict:
@@ -33,6 +33,15 @@ def _blank() -> dict:
 def _add(target: dict, source: dict) -> None:
     for key in target:
         target[key] = round(target[key] + float(source.get(key, 0.0)), 2)
+
+
+def _best_rule_sum(result: dict) -> dict:
+    totals = _blank()
+    for bucket in result["buckets"]:
+        code = bucket["headline_gap"].get("best_rule") or "earliest"
+        policy = next(row for row in bucket["policies"] if row["policy_code"] == code)
+        _add(totals, policy)
+    return totals
 
 
 def _policy_sum(result: dict, code: str) -> dict:
@@ -140,7 +149,7 @@ def _expedite(result: dict) -> dict:
         "emergency_cost_if_clearing_worthwhile_shortfalls_rm": round_rm(worth_cost),
         "net_benefit_if_those_are_expedited_rm": round_rm(worth_benefit),
         "emergency_cost_if_clearing_low_consequence_shortfalls_rm": round_rm(rejected_cost),
-        "note": "Emergency RM per m³ is a labelled assumption. The optimiser does not add this capacity. A person would have to approve overtime or outside supply.",
+        "note": "Emergency cost closes a firing lump. It is a labelled assumption and a proposal for approval. It is not added to base capacity.",
     }
 
 
@@ -162,6 +171,7 @@ def build_impact() -> dict:
     world = load_world()
     practice = _policy_sum(result, "practice")
     earliest = _policy_sum(result, "earliest")
+    best = _best_rule_sum(result)
     internal = _policy_sum(result, "internal")
     external = _policy_sum(result, "external")
     pilot = _policy_sum(result, "optimised")
@@ -190,15 +200,15 @@ def build_impact() -> dict:
     inventory = _inventory(world, result)
     expedite = _expedite(result)
     band = value_protected_band(result)
-    value_protected = band["base_rm"]
     return {
         "horizon": result["horizon"],
-        "baseline_name": "Earliest required date — primary comparison, not observed practice",
+        "baseline_name": "Best simple rule — primary comparison, not observed practice",
         "pilot_name": "Optimised — minimise business consequence",
         "approved_name": "Approved — human decision where recorded",
         "columns": [
-            {"key": "earliest", "label": "Earliest required date", "detail": "Primary comparison on the same demand and capacity. A named rule, not a record of what the plant did.", **earliest},
-            {"key": "pilot", "label": "Optimised", "detail": "Linear programme. No internal or external preference.", **pilot},
+            {"key": "best", "label": "Best simple rule", "detail": "Lowest of earliest-date, penalty and delay per m³, complete-or-skip, and greedy unit expected, chosen per plant-product.", **best},
+            {"key": "earliest", "label": "Earliest required date", "detail": "Second comparison on the same demand and capacity. A named rule, not a record of what the plant did.", **earliest},
+            {"key": "pilot", "label": "Optimised", "detail": "Mixed-integer programme under each order's penalty and delay type.", **pilot},
             {"key": "approved", "label": "Approved plan", "detail": "Latest human decision on each plant and product, otherwise the recommendation.", **approved},
         ],
         "upper_bound": {
@@ -214,8 +224,11 @@ def build_impact() -> dict:
         ],
         "inventory": inventory,
         "expedite": expedite,
-        "value_protected_rm": value_protected,
-        "value_protected_vs_earliest_rm": value_protected,
+        "value_protected_rm": result["totals"]["value_protected_vs_best_rule_rm"],
+        "value_protected_vs_earliest_rm": result["totals"]["value_protected_vs_earliest_rm"],
+        "best_rule_by_bucket": result["totals"]["best_rule_by_bucket"],
+        "verify_contracts": value_of_information(result),
+        "stress": load_stress_report(),
         "value_protected_range": band,
         "value_protected_note": band["formula"],
         "approved_buckets": len(covered),

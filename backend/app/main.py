@@ -16,6 +16,7 @@ from app.economics import ASSUMPTIONS, HORIZON_END, HORIZON_START
 from app.engine import (
     allocate,
     apply_scenario,
+    assess_fragility,
     capacity_view,
     control_tower,
     feasibility,
@@ -23,6 +24,7 @@ from app.engine import (
     parse_user_date,
     score_targets,
     solve_bucket,
+    value_of_information,
 )
 from app.extractor import SAMPLE_EMAIL, SAMPLE_OCR, extract_demand
 from app.forecast import build_forecast
@@ -86,6 +88,7 @@ class DemandAdjustment(BaseModel):
     delay_cost_per_day: float | None = None
     project_criticality: str | None = None
     confidence_level: Literal["Confirmed", "Probable", "Forecast"] | None = None
+    unit_expected_factor: float | None = Field(default=None, ge=0.5, le=1.5)
 
 
 class ScenarioIn(BaseModel):
@@ -142,6 +145,8 @@ class DecisionIn(OverrideIn):
     username: str = Field(min_length=2, max_length=80)
     override_reason: str = Field(min_length=3, max_length=1000)
     reason_category: str = ""
+    chosen_plan: str = ""
+    terms_confirmed: bool = False
 
 
 class ActualIn(BaseModel):
@@ -378,6 +383,28 @@ def get_capacity(plant_id: int = Query(...), product_id: int = Query(...)) -> di
     return capacity_view(plant_id, product_id)
 
 
+def _known_bucket(plant_id: int, product_id: int) -> None:
+    world = load_world()
+    if not any(row["id"] == plant_id for row in world["plants"]):
+        raise HTTPException(status_code=404, detail="Plant not found.")
+    if not any(row["id"] == product_id for row in world["products"]):
+        raise HTTPException(status_code=404, detail="Product not found.")
+
+
+@app.get("/api/contract-flips")
+def get_contract_flips(plant_id: int = Query(...), product_id: int = Query(...)) -> dict:
+    _known_bucket(plant_id, product_id)
+    report = value_of_information()
+    lines = [row for row in report["lines"] if row["plant_id"] == plant_id and row["product_id"] == product_id and row["allocation_changed"] and row["types_unverified"]]
+    return {"lines": lines, "order_count_note": report["order_count_note"]}
+
+
+@app.get("/api/fragility")
+def get_fragility(plant_id: int = Query(...), product_id: int = Query(...)) -> dict:
+    _known_bucket(plant_id, product_id)
+    return assess_fragility(plant_id, product_id)
+
+
 @app.post("/api/allocate")
 def run_allocation(scenario: ScenarioIn | None = None) -> dict:
     try:
@@ -455,6 +482,26 @@ def record_decision(body: DecisionIn) -> dict:
             raise HTTPException(status_code=400, detail=f"Override category must be one of: {', '.join(REASON_CATEGORIES)}.")
     else:
         category = category or "Accepted recommendation"
+    open_terms = [
+        row
+        for row in value_of_information()["lines"]
+        if row["plant_id"] == body.plant_id
+        and row["product_id"] == body.product_id
+        and row["allocation_changed"]
+        and row["types_unverified"]
+    ]
+    if open_terms and not body.terms_confirmed:
+        names = ", ".join(row["statement"] for row in open_terms)
+        raise HTTPException(
+            status_code=400,
+            detail=f"A commercial owner has to confirm the unverified contract term before sign-off. {names}",
+        )
+    if bucket.get("comparison", {}).get("plans_differ") and assess_fragility(body.plant_id, body.product_id)["fragile"]:
+        if body.chosen_plan not in {"typed", "proportional"}:
+            raise HTTPException(
+                status_code=400,
+                detail="This recommendation is fragile and the two plans differ. Choose the typed plan or the proportional comparison.",
+            )
     recommended_payload = {
         "scenario_name": world.get("scenario_name"),
         "allocations": bucket["allocations"],
@@ -485,8 +532,8 @@ def record_decision(body: DecisionIn) -> dict:
                 created_at, username, plant_id, product_id, plant_name, product_name,
                 recommended_json, final_json, override_reason, status,
                 consequence_recommended, consequence_final, unserved_recommended, unserved_final,
-                reason_category
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reason_category, chosen_plan, terms_confirmed
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now,
@@ -504,6 +551,8 @@ def record_decision(body: DecisionIn) -> dict:
                 bucket["unserved_m3"],
                 scored["unserved_m3"],
                 category,
+                body.chosen_plan,
+                1 if body.terms_confirmed else 0,
             ),
         )
         decision_id = cursor.lastrowid
