@@ -28,7 +28,8 @@ from app.engine import (
     solve_bucket,
     value_of_information,
 )
-from app.extractor import SAMPLE_EMAIL, SAMPLE_OCR, extract_demand
+from app.extractor import SAMPLE_EMAIL, SAMPLE_OCR
+from app.intake import confirm_intake, intake_metrics, intake_status, prepare_intake
 from app.forecast import build_forecast
 from app.impact import build_impact
 from app.measurement import build_illustration, build_measurement
@@ -120,8 +121,30 @@ class CompareIn(BaseModel):
 
 
 class ExtractIn(BaseModel):
-    text: str
-    source: Literal["Email intake", "Simulated OCR"] = "Email intake"
+    text: str = ""
+    source: Literal["Email intake", "Simulated OCR", "WhatsApp", "Manual"] = "Email intake"
+    as_of: str | None = None
+    image_base64: str | None = None
+
+
+class ConfirmIn(BaseModel):
+    action: Literal["save_new", "apply_change", "cancel", "manual"]
+    source: Literal["Email intake", "Simulated OCR", "WhatsApp", "Manual"] = "Manual"
+    input_hash: str = ""
+    mode: str = "manual"
+    extractor: str = "manual"
+    model: str = ""
+    latency_ms: int = 0
+    intent: str = "new"
+    proposed: dict = {}
+    draft: dict = {}
+    matched_demand_id: int | None = None
+    confirm_seconds: float = 0
+    received_at: str | None = None
+    contacts_kept_local: list[str] = []
+    accept_ceiling: bool = False
+    owner_name: str = ""
+    owner_role: str = ""
 
 
 class DemandCreate(BaseModel):
@@ -325,10 +348,45 @@ def list_demands(
     }
 
 
+@app.get("/api/intake/status")
+def get_intake_status() -> dict:
+    return intake_status()
+
+
 @app.post("/api/demands/extract")
-def extract(body: ExtractIn) -> dict:
+def extract(
+    body: ExtractIn,
+    role: str = Depends(require_writer),
+    x_forwarded_for: str | None = Header(default=None),
+) -> dict:
     world = load_world()
-    return extract_demand(body.text, world["plants"], world["products"], body.source)
+    client = (x_forwarded_for or "local").split(",")[0].strip() or "local"
+    with connect() as conn:
+        return prepare_intake(
+            body.text,
+            body.source,
+            world["plants"],
+            world["products"],
+            as_of=body.as_of,
+            role=role,
+            client_ip=client,
+            conn=conn,
+            image_supplied=bool(body.image_base64),
+        )
+
+
+@app.post("/api/intake/confirm")
+def intake_confirm(
+    body: ConfirmIn,
+    role: str = Depends(require_writer),
+    x_forwarded_for: str | None = Header(default=None),
+) -> dict:
+    client = (x_forwarded_for or "local").split(",")[0].strip() or "local"
+    with connect() as conn:
+        try:
+            return confirm_intake(conn, body.model_dump(), role, client)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/demands")
@@ -339,7 +397,7 @@ def create_demand(body: DemandCreate, _: str = Depends(require_writer)) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if body.confirmed_quantity - body.requested_quantity > 0.01:
         raise HTTPException(status_code=400, detail="Confirmed quantity cannot exceed requested quantity.")
-    if body.source not in ("Email intake", "Simulated OCR", "Manual"):
+    if body.source not in ("Email intake", "Simulated OCR", "WhatsApp", "Manual"):
         raise HTTPException(status_code=400, detail="New lines must come from intake or a manual entry.")
     prefix = "INT" if body.demand_type == "Internal" else "EXT"
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1052,6 +1110,8 @@ def measurement() -> dict:
 
     payload = build_measurement()
     payload["governance"] = governance_metrics()
+    with connect() as conn:
+        payload["intake"] = intake_metrics(conn)
     return payload
 
 

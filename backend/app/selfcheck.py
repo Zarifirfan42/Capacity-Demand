@@ -96,6 +96,18 @@ def main() -> None:
     print("Plant modes", {plant["name"]: plant_mode(plant["id"]) for plant in result["plants"]} if "plants" in result else "shadow by default")
     print("Governance opening lines", values["review_programme_days"], values["review_expected_rm"], values["review_penalty_rm"])
     print("Defaulted decisions on a fresh seed", int(defaulted))
+    from app.intake import effective_mode, load_eval_results
+
+    intake = load_eval_results()
+    assert intake["text_cases"] >= 12
+    assert intake["regex"]["status"] == "measured"
+    assert intake["llm"]["status"] in ("not_run", "measured")
+    if intake["llm"]["status"] == "measured":
+        assert intake["llm"].get("model")
+        assert intake["llm"].get("date")
+    print("Intake mode", effective_mode())
+    print("Intake eval cases", intake["text_cases"], "regex overall", intake["regex"]["overall"])
+    print("Intake LLM", intake["llm"]["status"])
     print("SELF-CHECK PASSED")
 
 
