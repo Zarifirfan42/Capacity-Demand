@@ -27,6 +27,7 @@ export function Layout() {
   const [hints, setHints] = useState<Record<string, string>>({});
   const [roles, setRoles] = useState<string[]>(["viewer", "scheduler", "plant_supervisor", "project_planner", "commercial_owner", "admin"]);
   const [identity, setIdentity] = useState("");
+  const [mockBadge, setMockBadge] = useState("");
   useEffect(() => {
     api<{ hints: Record<string, string>; roles: string[]; identity_note: string }>("/api/auth-status")
       .then((row) => {
@@ -34,6 +35,9 @@ export function Layout() {
         setRoles(row.roles);
         setIdentity(row.identity_note);
       })
+      .catch(() => undefined);
+    api<{ badge: string | null }>("/api/intake/status")
+      .then((row) => setMockBadge(row.badge || ""))
       .catch(() => undefined);
   }, []);
   return (
@@ -65,6 +69,7 @@ export function Layout() {
         </div>
       </aside>
       <main className="main">
+        {mockBadge ? <div className="mock-banner">{mockBadge}</div> : null}
         <Outlet />
       </main>
     </div>

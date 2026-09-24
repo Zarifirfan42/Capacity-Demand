@@ -24,6 +24,47 @@ type Draft = {
   notes: string;
 };
 
+type FieldView = { value: string | number | null; span: string; confidence: number; grounded: boolean; warning: string };
+type IntakeView = {
+  extractor: string;
+  badge: string | null;
+  intent: string;
+  input_hash: string;
+  mode: string;
+  model: string;
+  latency_ms: number;
+  fields: Record<string, FieldView>;
+  highlights: { field: string; start: number; end: number }[];
+  duplicate: { demand_code: string; reason: string } | null;
+  match: { demand_id: number; demand_code: string; summary: string; changes: { field: string; before: string | number; after: string | number }[] } | null;
+  contacts_kept_local: string[];
+  blocked_reasons: string[];
+  display_text: string;
+};
+
+function localStamp() {
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
+
+function SourceText({ text, marks }: { text: string; marks: { start: number; end: number }[] }) {
+  const parts: (string | { text: string; key: number })[] = [];
+  let cursor = 0;
+  marks.forEach((mark) => {
+    if (mark.start < cursor || mark.end > text.length) return;
+    if (mark.start > cursor) parts.push(text.slice(cursor, mark.start));
+    parts.push({ text: text.slice(mark.start, mark.end), key: mark.start });
+    cursor = mark.end;
+  });
+  if (cursor < text.length) parts.push(text.slice(cursor));
+  return (
+    <p className="source-text">
+      {parts.map((part, index) => (typeof part === "string" ? <span key={`t-${index}`}>{part}</span> : <mark key={part.key}>{part.text}</mark>))}
+    </p>
+  );
+}
+
 const EMPTY_FILTER = {
   plant_id: "",
   product_id: "",
@@ -46,6 +87,14 @@ export function DemandPage() {
   const [steps, setSteps] = useState<string[]>([]);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [draft, setDraft] = useState<Draft | null>(null);
+  const [intake, setIntake] = useState<IntakeView | null>(null);
+  const [proposed, setProposed] = useState<Record<string, string | number | null>>({});
+  const [receivedAt, setReceivedAt] = useState(localStamp);
+  const [started, setStarted] = useState<number | null>(null);
+  const [acceptCeiling, setAcceptCeiling] = useState(false);
+  const [ownerName, setOwnerName] = useState("");
+  const [ownerRole, setOwnerRole] = useState("");
+  const [manual, setManual] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [quality, setQuality] = useState<{ quality_percent: number; quality_meaning: string; failed: number; issues: { code: string; message: string }[]; synthetic_note: string } | null>(null);
@@ -86,28 +135,101 @@ export function DemandPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function extract(source: "Email intake" | "Simulated OCR", body = text) {
+  async function extract(source: "Email intake" | "Simulated OCR" | "WhatsApp", body = text) {
     setError("");
     setMessage("");
-    const result = await api<{ ok: boolean; steps: string[]; warnings: string[]; draft: Draft }>("/api/demands/extract", {
-      method: "POST",
-      body: JSON.stringify({ text: body, source }),
-    });
-    setSteps(result.steps);
-    setWarnings(result.warnings);
-    setDraft(result.draft);
+    setManual(false);
+    try {
+      const result = await api<{ ok: boolean; steps: string[]; warnings: string[]; draft: Draft } & IntakeView>("/api/demands/extract", {
+        method: "POST",
+        body: JSON.stringify({ text: body, source }),
+      });
+      setSteps(result.steps);
+      setWarnings(result.warnings);
+      setDraft(result.draft);
+      setIntake(result);
+      setProposed({
+        customer_or_project: result.draft?.customer_or_project ?? null,
+        demand_type: result.fields?.demand_type?.value ?? null,
+        plant_id: result.draft?.plant_id ?? null,
+        product_id: result.draft?.product_id ?? null,
+        requested_quantity: result.draft?.requested_quantity ?? null,
+        required_date: result.draft?.required_date ?? null,
+      });
+      setStarted(Date.now());
+      setAcceptCeiling(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not read the message.");
+    }
   }
 
-  async function saveDraft() {
-    if (!draft || draft.plant_id == null || draft.product_id == null || !draft.required_date || !draft.requested_quantity) {
+  function beginManual() {
+    setError("");
+    setMessage("");
+    setManual(true);
+    setIntake(null);
+    setSteps([]);
+    setWarnings(["This timer is a manual entry. Margin, penalty, and delay cost stay blank until you type them."]);
+    setDraft({
+      demand_type: "External",
+      customer_or_project: "",
+      customer_type: "Main contractor",
+      plant_id: null,
+      product_id: null,
+      required_date: "",
+      requested_quantity: null,
+      confirmed_quantity: 0,
+      demand_status: "Open",
+      confidence_level: "Probable",
+      contribution_margin: 0,
+      contractual_penalty: 0,
+      project_criticality: "n/a",
+      delay_days_if_unserved: 0,
+      delay_cost_per_day: 0,
+      source: "Manual",
+      notes: "",
+    });
+    setStarted(Date.now());
+  }
+
+  async function saveDraft(action: "save_new" | "apply_change" | "cancel" | "manual" = manual ? "manual" : "save_new") {
+    if (!draft) return;
+    if (action !== "cancel" && (draft.plant_id == null || draft.product_id == null || !draft.required_date || !draft.requested_quantity)) {
       setError("Complete plant, product, date, and quantity before adding the line.");
       return;
     }
     setError("");
-    await api("/api/demands", { method: "POST", body: JSON.stringify(draft) });
-    setMessage(`${draft.customer_or_project} is in the demand book. Run the allocation again to see whether it changes the recommendation.`);
-    setDraft(null);
-    load();
+    const proposal = manual ? {} : proposed;
+    try {
+      const saved = await api<{ demand_code: string }>("/api/intake/confirm", {
+        method: "POST",
+        body: JSON.stringify({
+          action,
+          source: draft.source,
+          input_hash: intake?.input_hash || "",
+          mode: manual ? "manual" : intake?.mode || "manual",
+          extractor: manual ? "manual" : intake?.extractor || "manual",
+          model: intake?.model || "",
+          latency_ms: intake?.latency_ms || 0,
+          intent: intake?.intent || "new",
+          proposed: proposal,
+          draft,
+          matched_demand_id: intake?.match?.demand_id ?? null,
+          confirm_seconds: started ? Math.round((Date.now() - started) / 1000) : 0,
+          received_at: receivedAt ? new Date(receivedAt).toISOString() : null,
+          contacts_kept_local: intake?.contacts_kept_local || [],
+          accept_ceiling: acceptCeiling,
+          owner_name: ownerName,
+          owner_role: ownerRole,
+        }),
+      });
+      setMessage(`${saved.demand_code} is updated in the demand book. Run the allocation again to see whether it changes the recommendation.`);
+      setDraft(null);
+      setIntake(null);
+      load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not confirm the line.");
+    }
   }
 
   async function remove(row: DemandRow) {
@@ -328,34 +450,85 @@ export function DemandPage() {
       ) : null}
       </> : null}
 
-      {tab === "intake" ? <Panel title="Prepare a demand line from text" sub="Rules stand in for OCR and document extraction. Confirm the draft before it joins the book.">
+      {tab === "intake" ? <Panel title="Prepare a demand line from text" sub="A person confirms every line. Margin, penalty, and delay cost are typed, not read from the message. Relative dates use 24 Sep 2026.">
         <div className="btn-row" style={{ marginBottom: 10 }}>
           <button className="btn" onClick={() => { const sample = meta?.samples.ocr ?? ""; setText(sample); void extract("Simulated OCR", sample); }}>Simulate OCR</button>
           <button className="btn" onClick={() => { const sample = meta?.samples.email ?? ""; setText(sample); void extract("Email intake", sample); }}>Load sample email</button>
+          <button className="btn" onClick={() => { const sample = "Hi this is Farah from Gamuda 012-3456789 farah@gamuda.example please book 30 m3 G50 at Pasir Gudang on 11 Oct 2026 confirmed"; setText(sample); void extract("WhatsApp", sample); }}>Load WhatsApp</button>
           <button className="btn primary" onClick={() => void extract("Email intake")}>Extract demand</button>
+          <button className="btn" onClick={beginManual}>Time a manual entry</button>
         </div>
         <div className="intake">
-          <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="Paste a PO, an email, or an OCR transcript." />
+          <div>
+            <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="Paste a PO, an email, a WhatsApp note, or an OCR transcript." />
+            {intake ? <SourceText text={intake.display_text || text} marks={intake.highlights || []} /> : null}
+          </div>
           <div>
             {steps.map((step) => <p key={step} className="note">{step}</p>)}
             {warnings.map((warning) => <p key={warning} className="error">{warning}</p>)}
+            {intake?.duplicate ? <p className="error">{intake.duplicate.reason}</p> : null}
+            {intake?.contacts_kept_local?.length ? <p className="note">Kept on this machine, not sent for reading: {intake.contacts_kept_local.join(", ")}</p> : null}
+            {intake?.match ? (
+              <div className="note">
+                <p>{intake.match.summary}. Nothing is saved until you confirm.</p>
+                <ul>
+                  {intake.match.changes.map((change) => <li key={change.field}>{change.field}: {String(change.before)} → {String(change.after)}</li>)}
+                </ul>
+                <button className="btn primary" onClick={() => void saveDraft(intake.intent === "cancel" ? "cancel" : "apply_change")}>Confirm {intake.match.summary}</button>
+              </div>
+            ) : null}
             {draft ? (
               <div className="mini">
-                <div className="field"><label>Name</label><input value={draft.customer_or_project} onChange={(event) => setDraft({ ...draft, customer_or_project: event.target.value })} /></div>
+                <div className="field"><label>Name</label><input value={draft.customer_or_project} onChange={(event) => setDraft({ ...draft, customer_or_project: event.target.value })} />{intake?.fields.customer_or_project?.span ? <span className="note">Source: {intake.fields.customer_or_project.span}</span> : null}</div>
                 <div className="field"><label>Type</label>
                   <select value={draft.demand_type} onChange={(event) => setDraft({ ...draft, demand_type: event.target.value })}>
                     <option>Internal</option>
                     <option>External</option>
                   </select>
                 </div>
-                <div className="field"><label>Quantity m³</label><input type="number" value={draft.requested_quantity ?? ""} onChange={(event) => setDraft({ ...draft, requested_quantity: Number(event.target.value) })} /></div>
-                <div className="field"><label>Required date</label><input type="date" value={draft.required_date ?? ""} onChange={(event) => setDraft({ ...draft, required_date: event.target.value })} /></div>
-                <div className="field"><label>Margin RM</label><input type="number" value={draft.contribution_margin} onChange={(event) => setDraft({ ...draft, contribution_margin: Number(event.target.value) })} /></div>
-                <div className="field"><label>Penalty RM</label><input type="number" value={draft.contractual_penalty} onChange={(event) => setDraft({ ...draft, contractual_penalty: Number(event.target.value) })} /></div>
-                <button className="btn primary" onClick={() => void saveDraft()}>Add to demand book</button>
+                <div className="field"><label>Plant</label>
+                  <select value={draft.plant_id ?? ""} onChange={(event) => setDraft({ ...draft, plant_id: event.target.value ? Number(event.target.value) : null })}>
+                    <option value="">Choose</option>
+                    {(meta?.plants || []).map((plant) => <option key={plant.id} value={plant.id}>{plant.name}</option>)}
+                  </select>
+                  {intake?.fields.plant_name?.span ? <span className="note">Source: {intake.fields.plant_name.span}</span> : null}
+                </div>
+                <div className="field"><label>Product</label>
+                  <select value={draft.product_id ?? ""} onChange={(event) => setDraft({ ...draft, product_id: event.target.value ? Number(event.target.value) : null })}>
+                    <option value="">Choose</option>
+                    {(meta?.products || []).map((product) => <option key={product.id} value={product.id}>{product.code}</option>)}
+                  </select>
+                  {intake?.fields.product_code?.span ? <span className="note">Source: {intake.fields.product_code.span}</span> : null}
+                </div>
+                <div className="field"><label>Quantity m³</label><input type="number" value={draft.requested_quantity ?? ""} onChange={(event) => setDraft({ ...draft, requested_quantity: Number(event.target.value) })} />{intake?.fields.quantity_m3?.span ? <span className="note">Source: {intake.fields.quantity_m3.span}</span> : null}</div>
+                <div className="field"><label>Required date</label><input type="date" value={draft.required_date ?? ""} onChange={(event) => setDraft({ ...draft, required_date: event.target.value })} />{intake?.fields.required_date?.span ? <span className="note">Source: {intake.fields.required_date.span}</span> : null}</div>
+                <div className="field"><label>Received</label><input type="datetime-local" value={receivedAt} onChange={(event) => setReceivedAt(event.target.value)} /></div>
+                <div className="field"><label>Owner</label><input value={ownerName} onChange={(event) => setOwnerName(event.target.value)} placeholder="Typed, not extracted" /></div>
+                <div className="field"><label>Owner role</label><input value={ownerRole} onChange={(event) => setOwnerRole(event.target.value)} /></div>
+                <div className="field"><label>Margin RM, typed</label><input type="number" value={draft.contribution_margin} onChange={(event) => setDraft({ ...draft, contribution_margin: Number(event.target.value) })} /></div>
+                <div className="field"><label>Penalty RM, typed</label><input type="number" value={draft.contractual_penalty} onChange={(event) => setDraft({ ...draft, contractual_penalty: Number(event.target.value) })} /></div>
+                <div className="field"><label>Delay days, typed</label><input type="number" value={draft.delay_days_if_unserved} onChange={(event) => setDraft({ ...draft, delay_days_if_unserved: Number(event.target.value) })} /></div>
+                <div className="field"><label>Delay RM per day, typed</label><input type="number" value={draft.delay_cost_per_day} onChange={(event) => setDraft({ ...draft, delay_cost_per_day: Number(event.target.value) })} /></div>
+                {warnings.some((warning) => warning.includes("2,000") || warning.includes("2000")) ? (
+                  <label className="note"><input type="checkbox" checked={acceptCeiling} onChange={(event) => setAcceptCeiling(event.target.checked)} /> Accept a quantity above 2,000 m³</label>
+                ) : null}
+                {intake?.intent === "cancel" ? null : <button className="btn primary" onClick={() => void saveDraft(manual ? "manual" : "save_new")}>{manual ? "Save manual line" : "Add to demand book"}</button>}
               </div>
-            ) : <p className="note">Extract a document to review the draft.</p>}
+            ) : <p className="note">Extract a document, or time a manual entry. The scheduler seat confirms it.</p>}
           </div>
+        </div>
+        <div className="table-wrap" style={{ marginTop: 16 }}>
+          <table>
+            <thead><tr><th>Use</th><th>Where</th></tr></thead>
+            <tbody>
+              <tr><td>Read a message into a demand line, then a person confirms it</td><td>Use now</td></tr>
+              <tr><td>Forecasting with a learned model</td><td>Premature</td></tr>
+              <tr><td>Letting a model choose the allocation</td><td>Never</td></tr>
+              <tr><td>Anomaly flags on the book</td><td>Later</td></tr>
+              <tr><td>Reading a contract clause for penalty type</td><td>Pilot, after a legal review. Not in this build.</td></tr>
+              <tr><td>Reading a photo of a paper order</td><td>Behind a flag. Three synthetic images are in the eval set. Vision was not run.</td></tr>
+            </tbody>
+          </table>
         </div>
       </Panel> : null}
     </div>

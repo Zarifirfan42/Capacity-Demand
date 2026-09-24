@@ -103,6 +103,9 @@ tr.constrained td { background: #fff7f8; }
 .badge.ok { background: var(--accent-soft); color: var(--accent); }
 .badge.warn { background: var(--amber-soft); color: var(--amber); }
 .badge.neutral { background: #eef2f5; color: #445566; }
+.mock-banner { position: sticky; top: 0; z-index: 5; background: var(--amber-soft); color: var(--amber); padding: 8px 16px; font-weight: 700; }
+.source-text { white-space: pre-wrap; background: white; border: 1px solid #c9d4de; border-radius: 8px; padding: 10px; margin-top: 8px; }
+.source-text mark { background: var(--amber-soft); color: inherit; }
 
 .filters { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
 .field { display: flex; flex-direction: column; gap: 4px; min-width: 140px; }

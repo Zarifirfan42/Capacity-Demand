@@ -39,6 +39,18 @@ type Measurement = {
     constraints_bound_n: number;
     constraints_checked_n: number;
   };
+  intake?: {
+    correction_rate: number | null;
+    correction_n: number;
+    correction_note: string;
+    median_confirm_seconds: { llm: number | null; llm_n: number; manual: number | null; manual_n: number; regex: number | null; regex_n: number };
+    order_to_book_hours_median: number | null;
+    order_to_book_n: number;
+    late_entry_share: number | null;
+    late_entry_n: number;
+    late_days: number;
+    late_definition: string;
+  };
   illustration: {
     watermark: string;
     missing?: boolean;
@@ -173,6 +185,16 @@ export function MeasurementPage() {
         </div>
         <div className="field grow"><label>Why this proposal</label><textarea value={proposal.reason} onChange={(event) => setProposal({ ...proposal, reason: event.target.value })} /></div>
         <button className="btn" onClick={() => void api("/api/settings/proposals", { method: "POST", body: JSON.stringify({ username: name || "Planner", key: proposal.key, proposed_value: proposal.value, reason: proposal.reason }) }).then(() => setTick((value) => value + 1)).catch((err: Error) => setError(err.message))}>Propose a threshold for the next cycle</button>
+      </Panel>
+      <Panel title="Intake" sub="Correction rate is an extraction check. Order-to-book time is the business measure. Both are shown with n.">
+        {data.intake ? (
+          <>
+            <p>Field correction rate {data.intake.correction_rate == null ? "—" : data.intake.correction_rate} on n = {data.intake.correction_n}. {data.intake.correction_note}</p>
+            <p>Median seconds to confirm. Model path {data.intake.median_confirm_seconds.llm == null ? "—" : data.intake.median_confirm_seconds.llm} on n = {data.intake.median_confirm_seconds.llm_n}. Manual path {data.intake.median_confirm_seconds.manual == null ? "—" : data.intake.median_confirm_seconds.manual} on n = {data.intake.median_confirm_seconds.manual_n}. Regex path {data.intake.median_confirm_seconds.regex == null ? "—" : data.intake.median_confirm_seconds.regex} on n = {data.intake.median_confirm_seconds.regex_n}.</p>
+            <p>Order-to-book median {data.intake.order_to_book_hours_median == null ? "—" : `${data.intake.order_to_book_hours_median} hours`} on n = {data.intake.order_to_book_n}.</p>
+            <p>Share entered within {data.intake.late_days} days of the required date: {data.intake.late_entry_share == null ? "—" : data.intake.late_entry_share} on n = {data.intake.late_entry_n}. {data.intake.late_definition}</p>
+          </>
+        ) : <p>n = 0.</p>}
       </Panel>
       <Panel title="Expedite records" sub="Estimated avoided is counterfactual. The page shows counts.">
         <p>n = {live.expedite.n}. Approved {live.expedite.approved}. Declined {live.expedite.declined}. {live.expedite.label}: {rm(live.expedite.estimated_avoided_rm)}.</p>
