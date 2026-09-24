@@ -495,11 +495,17 @@ def _demand_rows() -> list[tuple]:
 
 
 def seed(force: bool = False) -> None:
+    """Fill an empty database. Never deletes decisions, actuals, or other user rows.
+
+    `force` is ignored. Wiping the demo is POST /api/admin/reset, which requires the admin passcode.
+    """
+    del force
     init_db()
     with connect() as conn:
-        if not force and get_meta(conn, "seed_version") == SEED_VERSION:
+        existing = conn.execute("SELECT COUNT(*) AS n FROM plants").fetchone()
+        count = existing["n"] if hasattr(existing, "keys") else existing[0]
+        if int(count) > 0:
             return
-        reset_data(conn)
         conn.executemany("INSERT INTO plants(id, code, name, location) VALUES(?, ?, ?, ?)", PLANTS)
         conn.executemany(
             """
