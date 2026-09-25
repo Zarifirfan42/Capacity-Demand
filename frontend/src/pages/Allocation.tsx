@@ -652,7 +652,7 @@ export function AllocationPage() {
               {bucket.allocations.map((line) => <option key={line.demand_id} value={line.demand_id}>{line.customer_or_project}</option>)}
             </select>
           </div>
-          <button className="btn" onClick={() => void api(`/api/decisions/${bucket.open_decision?.id}/constraints`, { method: "POST", body: JSON.stringify({ username: name, kind: constraintKind, quantity: constraintQty, evidence_type: constraintEvidence, demand_id: constraintDemand || null, note: signReason || "Recorded from the evidence named above." }) }).then((row: { label?: string }) => { setSaved(row.label || "Constraint applied."); setReveal((value) => value + 1); }).catch((err: Error) => setError(err.message))}>Apply constraint and re-solve</button>
+          <button className="btn" onClick={() => void api(`/api/decisions/${bucket.open_decision?.id}/constraints`, { method: "POST", body: JSON.stringify({ username: name, kind: constraintKind, quantity: constraintQty, evidence_type: constraintEvidence, demand_id: constraintDemand || null, note: signReason || "Recorded from the evidence named above." }) }).then((row) => { const saved = row as { label?: string }; setSaved(saved.label || "Constraint applied."); setReveal((value) => value + 1); }).catch((err: Error) => setError(err.message))}>Apply constraint and re-solve</button>
           {role === "plant_supervisor" ? (
             <div className="field grow">
               <label>Plant supervisor note</label>
