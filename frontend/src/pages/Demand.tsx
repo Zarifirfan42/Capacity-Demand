@@ -273,7 +273,7 @@ export function DemandPage() {
         </Panel>
       ) : null}
       {tab === "planning" ? (
-        <Panel title="Demand planning" sub="Synthetic history. The forecast is not a confirmed order.">
+        <Panel title="Demand planning" sub="Synthetic history. A learned forecast is premature: twelve patterned months are not a plant's own history. The moving average below is not a confirmed order and is not passed to the allocator.">
           {planning ? <p className="note">October book: confirmed {m3(planning.by_confidence_m3.Confirmed ?? 0)}, probable {m3(planning.by_confidence_m3.Probable ?? 0)}, forecast-class lines already in the book {m3(planning.by_confidence_m3.Forecast ?? 0)}. {planning.certainty_note} {planning.forecast_method}</p> : null}
           {forecast ? (
             <>

@@ -103,6 +103,16 @@ export function ControlTowerPage() {
     );
   }
   const k = data.kpis;
+  const attention = [...data.hotspots].sort((a, b) => b.expected_consequence_rm - a.expected_consequence_rm)[0];
+  const attentionWhy = attention?.why.split(/(?<=\.)\s/)[0] || "";
+  const decisionHref = attention ? `/allocation?plant=${attention.plant_id}&product=${attention.product_id}` : "/allocation";
+  const demoPath: { href: string; step: string; title: string; text: string }[] = [
+    { href: "/", step: "1", title: "Shortage", text: "Demand exceeds dated capacity. The month total can still show a surplus." },
+    { href: "/demand", step: "2", title: "Both books", text: "Internal projects and external customers sit in one order book." },
+    { href: decisionHref, step: "3", title: "Recommendation", text: "Record what you would run. The screen then shows who is served, and why." },
+    { href: "/scenarios", step: "4", title: "What-if", text: "Change capacity or a required date. The consequence is recalculated." },
+    { href: "/measurement", step: "5", title: "Outcome", text: "The recorded decision is what later gets compared with what happened." },
+  ];
   const policies = [
     { name: "Recommended", value: data.policy_totals.optimised_rm },
     { name: "Best simple rule", value: data.policy_totals.optimised_rm + k.value_protected_rm },
@@ -115,14 +125,50 @@ export function ControlTowerPage() {
   return (
     <div className="page">
       <PageHeader
-        kicker={`${longDate(data.horizon.start)} – ${longDate(data.horizon.end)}`}
+        kicker={`Illustrative / simulated scenario · ${longDate(data.horizon.start)} – ${longDate(data.horizon.end)}`}
         title="Control Tower"
-        lede={data.question}
+        lede="What is short, what is coming, what to do, and what it costs. The figures below are the synthetic October book, not company records."
       />
+      <section className="brief" aria-label="This morning">
+        <article>
+          <p>What is happening</p>
+          <strong>Dated shortfall {m3(k.capacity_gap_m3)}</strong>
+          <span>Demand {m3(k.total_demand_m3)} against capacity {m3(k.available_capacity_m3)}, plus {m3(k.usable_inventory_m3)} usable precast inventory. Adding the month gives a surplus of {m3(k.horizon_surplus_m3)}. That surplus is on the wrong dates.</span>
+        </article>
+        <article>
+          <p>What is going to happen</p>
+          <strong>{attention ? `${attention.plant_name}, ${attention.product_name}` : "No constrained book"}</strong>
+          <span>{attention ? `Short ${m3(attention.shortfall_m3)} by ${longDate(attention.crunch_date)}. ${k.constrained_buckets} plant-product books cannot be fully served on the required dates.` : "Every plant-product book can be served on the required dates."}</span>
+        </article>
+        <article>
+          <p>What should we do</p>
+          <strong>{attention ? "Review the recommendation. A person decides." : "No allocation decision is waiting."}</strong>
+          <span>{attention ? `${attentionWhy} ` : "Open the demand book if a new order arrives. "}{attention ? <Link to={decisionHref}>Open this book</Link> : null}</span>
+        </article>
+        <article>
+          <p>What is the business consequence</p>
+          <strong>Margin left open {rm(k.margin_at_risk_rm)}</strong>
+          <span>Programme days left open {num(k.programme_days_at_risk, 1)}. Inventory at constrained books {rm(k.inventory_at_risk_rm)}, an assumption. Modelled gap versus the best simple rule {rm(k.value_protected_rm)}. That gap is not observed savings.</span>
+        </article>
+      </section>
+      <Panel title="Show this in five minutes" sub="The same synthetic book, in the order a plant review would follow.">
+        <ol className="demo-path">
+          {demoPath.map((item) => (
+            <li key={item.step}>
+              <Link to={item.href}>
+                <small>Step {item.step}</small>
+                <strong>{item.title}</strong>
+                <span>{item.text}</span>
+              </Link>
+            </li>
+          ))}
+        </ol>
+      </Panel>
       <div className="banner risk">
         <strong>The month is not short of cubic metres. It is short on the dates that matter.</strong>
         {data.insight}
       </div>
+      <p className="note">{data.question}</p>
       {data.exceptions && data.exceptions.length > 0 ? (
         <Panel title="Where to act" sub="Constrained plant and product books. Open one to see who is left short, and why.">
           <ul>
@@ -145,7 +191,8 @@ export function ControlTowerPage() {
         <Kpi label="Programme days at risk" value={num(k.programme_days_at_risk, 1)} tone="risk" hint="Internal delay days scaled by the unserved fraction" />
         <Kpi label="Modelled gap vs best simple rule" value={rm(k.value_protected_rm)} tone="good" hint={`${k.value_protected_note} All-linear ${rm(band.all_linear_rm ?? band.low_rm)}. Seeded mix ${rm(band.seeded_rm ?? band.base_rm)}. All-lump ${rm(band.all_lump_rm ?? band.high_rm)}.`} />
       </div>
-      <Panel title="How this number is calculated" sub="Modelled on the synthetic book. Not observed savings.">
+      <details className="assumptions">
+        <summary>How the modelled gap is calculated</summary>
         <p>{band.formula}</p>
         <p>
           All-linear {rm(band.all_linear_rm ?? band.low_rm)}. Seeded mix {rm(band.seeded_rm ?? band.base_rm)}. All-lump {rm(band.all_lump_rm ?? band.high_rm)}.
@@ -158,7 +205,7 @@ export function ControlTowerPage() {
             {k.headline_gap_note} Across the book the true gap is {rm(k.value_protected_rm)}. Scoring the same two allocations as linear gives {rm(k.headline_gap_if_scored_proportional_rm ?? 0)}. The effect of using each order's own penalty and delay type is {rm(k.headline_gap_effect_rm ?? 0)}.
           </p>
         ) : null}
-      </Panel>
+      </details>
       {k.party_burden ? (
         <Panel title="Who bears the shortfall" sub={k.party_burden.note}>
           <p>
@@ -254,6 +301,16 @@ export function ControlTowerPage() {
             </table>
           </div>
         )}
+      </Panel>
+      <Panel title="Proposed 12-week pilot" sub="A sequence for a real plant. This screen is the weeks 5–8 prototype, running on synthetic data. It is not a completed pilot.">
+        <ol className="pilot">
+          <li>Weeks 1–2. Take the plant’s current sheets, paper, and message trail. Record today’s allocation rule and the margin, inventory, and programme days it leaves open.</li>
+          <li>Weeks 3–4. Put internal projects and external orders in one book, with required date, margin, penalty, and delay cost. Mark missing fields instead of filling them in.</li>
+          <li>Weeks 5–6. Run this allocation beside the current rule. The model recommends. It does not book the plant.</li>
+          <li>Weeks 7–8. One scheduler uses the screen each morning. Decisions stay at the plant unless a stated review line is crossed.</li>
+          <li>Weeks 9–10. A person confirms demand drafted from messages. The draft does not allocate.</li>
+          <li>Weeks 11–12. Compare recorded decisions with what was delivered: margin left open, inventory, programme days, and forecast error. Usage is not the result.</li>
+        </ol>
       </Panel>
       <Assumptions items={data.assumptions} />
     </div>
