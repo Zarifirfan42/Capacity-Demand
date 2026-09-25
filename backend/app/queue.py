@@ -201,7 +201,7 @@ def expire_demo() -> dict:
         )
     result = apply_expired_defaults()
     result["demo"] = True
-    result["note"] = "Simulate expiry is demo mode. It calls the same default function as the hourly job."
+    result["note"] = "Simulate expiry is demo mode. It calls the same default function as the daily job."
     return result
 
 

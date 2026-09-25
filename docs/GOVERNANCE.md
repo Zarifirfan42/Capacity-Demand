@@ -21,7 +21,7 @@ The plant supervisor is consulted on an open sign-off and does not hold a veto. 
 
 Sign-off stays open for 24 hours. If the first affected required date is inside 24 hours of the recommendation, the window is 2 hours. While it is open, the proposed quantities are a soft hold so the same capacity is not offered twice. The hold is not a commitment.
 
-An hourly Vercel cron calls `GET /api/cron/governance`. The job is idempotent. `defaulted_at` is the deadline, not the time the job happened to run. If `CDI_CRON_SECRET` or `CRON_SECRET` is set, the request must send `Authorization: Bearer` that secret. Opening a page does not write.
+A daily Vercel cron calls `GET /api/cron/governance` at 02:00 UTC. A Hobby account rejects an hourly schedule, so the job runs once a day. The job is idempotent. `defaulted_at` is the deadline, not the time the job happened to run. If `CDI_CRON_SECRET` or `CRON_SECRET` is set, the request must send `Authorization: Bearer` that secret. Opening a page does not write.
 
 When the required owners sign different plans and nobody has recorded a constraint, the plan with the lower expected consequence under the stated terms is the one that applies. With two seats, that rule makes the model the tie-breaker on purpose.
 
